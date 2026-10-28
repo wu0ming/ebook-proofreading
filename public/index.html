@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>砚舟 · 小说批量校对工作台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">砚</div>
+        <div>
+          <p class="eyebrow">LOCAL NOVEL PROOFREADING</p>
+          <h1>砚舟 · 小说批量校对工作台</h1>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <div class="status-pill" id="serverStatus"><span class="dot ok"></span>工作台已就绪</div>
+        <div class="status-pill" id="freeLlmStatus"><span class="dot"></span>检测 FreeLLM</div>
+        <button class="button secondary compact" id="startFreeLlmButton">启动 FreeLLMAPI</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="rail">
+        <div class="rail-intro">
+          <span class="rail-kicker">WORKFLOW</span>
+          <h2>从原稿到校对版</h2>
+          <p>源文件始终只读。拆章、校对、合并和导出都在独立任务中完成。</p>
+        </div>
+        <ol class="step-list">
+          <li class="step active" data-step="1"><span>01</span><div><strong>导入原稿</strong><small>TXT 智能拆章</small></div></li>
+          <li class="step" data-step="2"><span>02</span><div><strong>选择范围</strong><small>章节与规则</small></div></li>
+          <li class="step" data-step="3"><span>03</span><div><strong>批量校对</strong><small>分批并发处理</small></div></li>
+          <li class="step" data-step="4"><span>04</span><div><strong>合并导出</strong><small>TXT 与报告</small></div></li>
+        </ol>
+        <div class="safety-note">
+          <span class="safety-icon">只读</span>
+          <div><strong>不会覆盖源 TXT</strong><p>失败章节会保留规则清理版，并写入报告。</p></div>
+        </div>
+      </aside>
+
+      <section class="content">
+        <section class="hero-card card">
+          <div>
+            <p class="eyebrow">SMART CHAPTER PIPELINE</p>
+            <h2>把抓取文本变成干净、可追踪的章节</h2>
+            <p class="hero-copy">识别中文数字与阿拉伯数字章节，合并重复标题，清除翻页广告和异书片段，再交给模型做保守校对。</p>
+          </div>
+          <div class="hero-metric">
+            <span>推荐默认</span>
+            <strong>3 × 2</strong>
+            <small>每批 3 章 · 并发 2 批</small>
+          </div>
+        </section>
+
+        <section class="card upload-card" id="uploadCard">
+          <div class="section-heading">
+            <div><span class="section-index">01</span><div><h2>导入 TXT 原稿</h2><p>文件在浏览器中读取并发送给本机工作台，不会覆盖原文件。</p></div></div>
+            <span class="mini-tag">UTF-8 / GBK 浏览器可读文本</span>
+          </div>
+          <label class="drop-zone" id="dropZone" for="fileInput">
+            <input id="fileInput" type="file" accept=".txt,text/plain">
+            <span class="upload-glyph">TXT</span>
+            <strong>点击选择，或把小说拖到这里</strong>
+            <small>建议单文件不超过 50 MB</small>
+          </label>
+          <div class="file-line hidden" id="fileLine">
+            <div><span class="file-icon">文</span><div><strong id="fileName">—</strong><small id="fileSize">—</small></div></div>
+            <span class="analysis-state" id="analysisState">等待分析</span>
+          </div>
+        </section>
+
+        <section class="card hidden" id="analysisCard">
+          <div class="section-heading">
+            <div><span class="section-index">02</span><div><h2>拆章结果与处理范围</h2><p>先看章节完整性，再决定本次需要校对的范围。</p></div></div>
+            <button class="button ghost compact" id="toggleChapterList">查看章节清单</button>
+          </div>
+
+          <div class="metric-grid">
+            <div class="metric"><span>识别章节</span><strong id="chapterCount">0</strong><small id="chapterRange">—</small></div>
+            <div class="metric"><span>平均长度</span><strong id="averageChars">0</strong><small>字符 / 章</small></div>
+            <div class="metric"><span>重复标题</span><strong id="duplicateHeaders">0</strong><small>已自动合并</small></div>
+            <div class="metric"><span>异常噪声</span><strong id="noiseCount">0</strong><small>已标记或清除</small></div>
+          </div>
+
+          <div class="warning-strip hidden" id="warningStrip">
+            <strong>章节完整性提醒</strong>
+            <span id="warningText"></span>
+          </div>
+
+          <div class="chapter-table-wrap hidden" id="chapterTableWrap">
+            <table class="chapter-table">
+              <thead><tr><th>章节</th><th>标题</th><th>字符数</th><th>源行</th><th>状态</th></tr></thead>
+              <tbody id="chapterTableBody"></tbody>
+            </table>
+          </div>
+
+          <div class="form-grid range-grid">
+            <label class="field"><span>起始章节</span><input id="startChapter" type="number" min="1" value="240"></label>
+            <label class="field"><span>结束章节</span><input id="endChapter" type="number" min="1"></label>
+            <div class="range-summary"><span>预计处理</span><strong id="selectedCount">0 章</strong><small id="selectedChars">约 0 字符</small></div>
+          </div>
+        </section>
+
+        <section class="two-column hidden" id="configurationArea">
+          <section class="card">
+            <div class="section-heading compact-heading">
+              <div><span class="section-index">03</span><div><h2>模型连接</h2><p>默认连接本机 FreeLLMAPI，也可换成其他 OpenAI 兼容服务。</p></div></div>
+            </div>
+            <div class="model-presets">
+              <button class="preset active" data-base="http://127.0.0.1:3001/v1" data-model="auto">FreeLLMAPI</button>
+              <button class="preset" data-base="http://127.0.0.1:11434/v1" data-model="qwen3:14b">Ollama</button>
+              <button class="preset" data-base="https://api.openai.com/v1" data-model="gpt-4o-mini">OpenAI</button>
+              <button class="preset" data-base="" data-model="">自定义</button>
+            </div>
+            <label class="field full"><span>Base URL</span><input id="baseUrl" type="url" value="http://127.0.0.1:3001/v1" spellcheck="false"></label>
+            <div class="form-grid">
+              <label class="field"><span>模型</span><input id="modelName" value="auto" spellcheck="false"></label>
+              <label class="field"><span>API Key</span><input id="apiKey" type="password" autocomplete="off" placeholder="FreeLLM 仪表盘密钥"></label>
+            </div>
+            <div class="inline-actions">
+              <button class="button secondary" id="testProviderButton">测试连接</button>
+              <span class="inline-status" id="providerTestStatus">尚未测试</span>
+            </div>
+            <label class="field full"><span>FreeLLM 启动脚本</span><input id="launcherPath" value="C:\Users\12196\Desktop\FreeLLMAPI 启动器.vbs" spellcheck="false"></label>
+          </section>
+
+          <section class="card">
+            <div class="section-heading compact-heading">
+              <div><span class="section-index">04</span><div><h2>批次与并发</h2><p>按实测章节长度控制上下文，避免模型截断。</p></div></div>
+            </div>
+            <div class="batch-visual">
+              <div class="batch-equation"><span id="batchFigure">3</span><small>章 / 批</small></div>
+              <span class="multiply">×</span>
+              <div class="batch-equation"><span id="concurrencyFigure">2</span><small>并发批次</small></div>
+              <span class="equals">=</span>
+              <div class="batch-equation accent"><span id="inFlightFigure">6</span><small>最多在途章节</small></div>
+            </div>
+            <div class="form-grid three">
+              <label class="field"><span>每批章节数</span><input id="chaptersPerBatch" type="number" min="1" max="10" value="3"></label>
+              <label class="field"><span>并发数</span><input id="concurrency" type="number" min="1" max="10" value="2"></label>
+              <label class="field"><span>单批字符上限</span><input id="maxCharsPerBatch" type="number" min="4000" max="50000" step="1000" value="18000"></label>
+            </div>
+            <div class="recommendation" id="batchRecommendation"><strong>当前建议</strong><span>适合约 4,700 字符/章的小说；并发 2 与开源工具常用默认一致。</span></div>
+            <div class="mode-switch">
+              <label><input type="radio" name="mode" value="llm" checked><span><strong>模型智能校对</strong><small>规则清理后再调用模型</small></span></label>
+              <label><input type="radio" name="mode" value="rules"><span><strong>仅规则整理</strong><small>离线快速处理，不调用模型</small></span></label>
+            </div>
+          </section>
+        </section>
+
+        <section class="card hidden" id="rulesCard">
+          <div class="section-heading compact-heading">
+            <div><span class="section-index">05</span><div><h2>校对规则</h2><p>这里的规则会随每个批次发送。建议写清“可以改什么、绝不能改什么”。</p></div></div>
+            <div class="rule-actions"><button class="button ghost compact" id="resetRulesButton">恢复推荐规则</button></div>
+          </div>
+          <textarea id="rulesEditor" class="rules-editor" spellcheck="false"></textarea>
+          <div class="editor-footer"><span id="rulesCount">0 字</span><span>保守校对 · 不扩写 · 不改剧情</span></div>
+        </section>
+
+        <section class="card hidden action-card" id="actionCard">
+          <div>
+            <h2>准备开始批量校对</h2>
+            <p id="jobSummary">请选择文件和章节范围。</p>
+          </div>
+          <button class="button primary large" id="startJobButton">开始校对并自动导出</button>
+        </section>
+
+        <section class="card hidden" id="progressCard">
+          <div class="section-heading">
+            <div><span class="section-index live">LIVE</span><div><h2>处理进度</h2><p id="progressSubtitle">任务正在准备。</p></div></div>
+            <div class="progress-actions">
+              <button class="button secondary compact" id="pauseJobButton">暂停</button>
+              <button class="button danger compact" id="cancelJobButton">取消</button>
+            </div>
+          </div>
+          <div class="progress-overview">
+            <div class="progress-ring" id="progressRing"><strong id="progressPercent">0%</strong><small>完成度</small></div>
+            <div class="progress-main">
+              <div class="progress-label"><strong id="progressChapterLabel">0 / 0 章</strong><span id="progressBatchLabel">0 / 0 批</span></div>
+              <div class="progress-track"><span id="progressBar"></span></div>
+              <div class="lane-grid" id="laneGrid"></div>
+            </div>
+          </div>
+          <div class="log-panel" id="logPanel"></div>
+          <div class="result-panel hidden" id="resultPanel">
+            <div><span class="result-check">完成</span><div><strong>校对版已合并并自动导出</strong><small id="resultDescription">TXT 与处理报告已生成。</small></div></div>
+            <div class="inline-actions"><a class="button primary" id="downloadTextLink" href="#">下载校对版 TXT</a><a class="button secondary" id="downloadReportLink" href="#">下载报告</a></div>
+          </div>
+        </section>
+
+        <footer class="footer">
+          <span>参考 Pagekin、bilingual_book_maker、snowflake-fiction 与 StoryVoice 的成熟工作流，自研轻量本地实现。</span>
+          <span>源文件只读 · 密钥默认不落盘</span>
+        </footer>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
