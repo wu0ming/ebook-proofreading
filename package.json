@@ -1,0 +1,15 @@
+{
+  "name": "novel-proofreading-workbench",
+  "version": "1.0.0",
+  "private": true,
+  "description": "本地优先的小说智能拆章与批量校对工作台",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test tests/*.test.js",
+    "prepare:book": "node scripts/prepare-book.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
