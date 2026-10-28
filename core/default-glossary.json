@@ -1,0 +1,35 @@
+x{
+  "version": 1,
+  "entries": [
+    {
+      "name": "赵升",
+      "type": "character",
+      "aliases": ["赵清阳", "降龙真人", "掌柜的"],
+      "note": "主角，百世书持有者，转生修仙界；对外曾化名赵清阳。"
+    },
+    {
+      "name": "百世书",
+      "type": "term",
+      "aliases": [],
+      "note": "主角至宝，每世结束后结算评价并发放继承奖励。"
+    },
+    {
+      "name": "动态视觉",
+      "type": "term",
+      "aliases": [],
+      "note": "天赋名，不可写成“动态视力”。"
+    },
+    {
+      "name": "天柱界",
+      "type": "place",
+      "aliases": ["天柱山"],
+      "note": "主要世界之一，赵氏兴起之地。"
+    },
+    {
+      "name": "兴龙赵氏",
+      "type": "organization",
+      "aliases": ["兴龙原赵家", "赵氏"],
+      "note": "主角家族，金丹家族。"
+    }
+  ]
+}
