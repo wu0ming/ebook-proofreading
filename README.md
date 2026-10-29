@@ -96,13 +96,13 @@ node server.js
 
 - **全局并发闸门**：所有任务共享一个在途请求上限（默认 8）。即使同时跑多个任务、每个任务并发调到 10，实际到达模型的请求也不会超过全局上限。
 - **动态并发**：初始 3，连续成功逐步升到 10；连续遇到 429 自动降档，最低 1。
-- **指数退避 + 随机抖动**：重试基础等待 2 秒、4 秒……再加随机偏移；上游返回 `Retry-After` 或响应体 `retryAtMs` 时优先遵守（上限 60 秒）。
+- **指数退避 + 随机抖动**：重试基础等待 2 秒、4 秒……再加随机偏移；上游返回 `Retry-After` 或响应体 `retryAtMs` 时优先遵守（上限 300 秒，免费池冷却通常 1-5 分钟，等不到窗口重置的 429  treadmill 就是这样来的）。
 - **错误分类**：429 / 502 / 503 / 504 / 408 / 网络失败 / 模型输出缺章或截断，按退避重试；401 / 403 / 400 / 404 视为配置问题，立即停止同配置重试。
 - **模型链**：模型框支持逗号分隔多个模型（如 `deepseek-v4-flash, glm-4.7-flash, qwen3.7-flash`），遇到限流或上游故障自动切换到下一个。
 - **路由与成功率**：`GET /api/scheduler` 与界面“请求调度”面板实时显示在途数、动态并发、成功率、各模型成功/失败统计与最近请求明细。
 - **三级自动补偿**：主流程 + 逐章重试轮 + 自动重试轮都失败的章节进入补偿队列——5 分钟第 1 次、30 分钟第 2 次、2 小时第 3 次；补偿成功立即替换规则回退版并刷新导出，三次都失败则保留并标记，可手动重试。
 
-这些行为都可以用环境变量覆盖（测试用）：`SCHEDULER_MAX_GLOBAL`、`SCHEDULER_INITIAL_CONCURRENCY`、`SCHEDULER_MAX_CONCURRENCY`、`SCHEDULER_BACKOFF_BASE_MS`、`SCHEDULER_MAX_ATTEMPTS`、`COMPENSATION_DELAYS_MS`、`COMPENSATION_TICK_MS`。
+这些行为都可以用环境变量覆盖（测试用）：`SCHEDULER_MAX_GLOBAL`、`SCHEDULER_INITIAL_CONCURRENCY`、`SCHEDULER_MAX_CONCURRENCY`、`SCHEDULER_BACKOFF_BASE_MS`、`SCHEDULER_RETRY_AFTER_CAP_MS`、`SCHEDULER_MAX_ATTEMPTS`、`COMPENSATION_DELAYS_MS`、`COMPENSATION_TICK_MS`。
 
 ## 默认批次建议
 
