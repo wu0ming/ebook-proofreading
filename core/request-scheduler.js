@@ -17,7 +17,8 @@ const DEFAULT_LIMITS = {
   rampUpAfter: 6, // 两次升档之间的最小请求数
   rampDownAfter: 2, // 连续遇到限流这么多次后，动态并发 -1
   backoffBaseMs: 2000, // 退避基数：第1次重试等 2s、第2次 4s……
-  backoffCapMs: 60000, // 单次退避上限
+  backoffCapMs: 60000, // 指数退避单次上限
+  retryAfterCapMs: 300000, // 遵守上游 Retry-After/retryAtMs 的上限（免费池冷却通常 1-5 分钟）
   maxAttempts: 4, // 单个批次的最大尝试次数
 };
 
@@ -219,7 +220,10 @@ class RequestScheduler {
         const retryAfterMs = (error instanceof SchedulerError && error.retryAfterMs) || null;
         const exponential = Math.min(this.limits.backoffCapMs, this.limits.backoffBaseMs * 2 ** (attempt - 1));
         const jitter = Math.random() * this.limits.backoffBaseMs;
-        const delay = retryAfterMs != null ? Math.min(this.limits.backoffCapMs, retryAfterMs) : exponential + jitter;
+        // 上游明确给出 Retry-After/retryAtMs 时优先遵守（上限 retryAfterCapMs），否则用指数退避加抖动。
+        const delay = retryAfterMs != null
+          ? Math.min(this.limits.retryAfterCapMs, Math.max(1000, retryAfterMs))
+          : exponential + jitter;
         this.stats.retried += 1;
         if (onRetry) {
           try { onRetry(attempt, error, delay); } catch { /* 日志回调失败不影响调度 */ }
@@ -243,6 +247,7 @@ function limitsFromEnv() {
     initialConcurrency: num(process.env.SCHEDULER_INITIAL_CONCURRENCY, DEFAULT_LIMITS.initialConcurrency),
     maxConcurrency: num(process.env.SCHEDULER_MAX_CONCURRENCY, DEFAULT_LIMITS.maxConcurrency),
     backoffBaseMs: num(process.env.SCHEDULER_BACKOFF_BASE_MS, DEFAULT_LIMITS.backoffBaseMs),
+    retryAfterCapMs: num(process.env.SCHEDULER_RETRY_AFTER_CAP_MS, DEFAULT_LIMITS.retryAfterCapMs),
     maxAttempts: num(process.env.SCHEDULER_MAX_ATTEMPTS, DEFAULT_LIMITS.maxAttempts),
   };
 }
