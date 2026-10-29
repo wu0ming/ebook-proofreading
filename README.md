@@ -76,7 +76,12 @@ node server.js
 6. 从 FreeLLMAPI 仪表盘复制统一密钥，填入 API Key 后点“测试连接”。
 7. 编辑校对规则、每批章节数、并发数、单批字符上限。
 8. 点击“开始校对并自动导出”。
-9. 完成后下载合并 TXT 和 JSON 报告。
+9. 在“处理进度”的“章节对比”中，点击已完成的章节，查看校对前后的标题和正文。红色删除线表示删除，绿色表示新增；模型校对失败的章节标记为“规则回退”。
+10. 完成后下载合并 TXT 和 JSON 报告。
+
+章节正文字符数按 Unicode 字符统计，包含空格和换行，不包含标题。校对前内容是拆章后的原文；拆章之前已移除的已知混入内容不会出现在对比中。对比覆盖规则清理和模型校对的综合结果。极长或变化很大的片段可能整段高亮，仍可查看完整内容。
+
+章节对比和任务状态保存在当前服务进程内，重启服务后需要重新导入并开始任务；导出的 TXT 和报告仍保存在 `exports/`。
 
 ## 默认批次建议
 
@@ -148,11 +153,12 @@ node server.js
 ├─ public/                     工作台前端
 │  ├─ index.html
 │  ├─ styles.css
-│  └─ app.js
+│  ├─ app.js
+│  └─ diff.js                  章节差异对比
 ├─ scripts/
 │  ├─ prepare-book.js          命令行整理与报告生成
 │  └─ smoke-test.js            端到端冒烟测试
-├─ tests/novel-core.test.js    核心规则测试
+├─ tests/                      核心规则与对比测试
 ├─ glossaries/                 词表存档（不进仓库）
 ├─ assets/                     FreeLLMAPI 启动脚本副本
 └─ 电子书校对.vbs              双击启动入口
@@ -180,7 +186,7 @@ node scripts/prepare-book.js \
 ## 测试
 
 ```bash
-node --test tests/novel-core.test.js
+node --test tests/*.test.js
 node scripts/smoke-test.js "你的小说.txt"           # 规则模式端到端
 node scripts/smoke-test-glossary.js "你的小说.txt" # 词表保存、读取与模型任务回退
 ```
