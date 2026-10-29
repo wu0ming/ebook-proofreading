@@ -6,3 +6,6 @@ glossaries/
 Thumbs.db
 .env
 config.local.json
+
+.jobs/
+.run-resumed-job.js
