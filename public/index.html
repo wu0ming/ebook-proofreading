@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>砚舟 · 小说批量校对工作台</title>
+  <title>电子书校对</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -14,7 +14,7 @@
         <div class="brand-mark">砚</div>
         <div>
           <p class="eyebrow">LOCAL NOVEL PROOFREADING</p>
-          <h1>砚舟 · 小说批量校对工作台</h1>
+          <h1>电子书校对</h1>
         </div>
       </div>
       <div class="topbar-actions">
@@ -111,22 +111,19 @@
             <div class="section-heading compact-heading">
               <div><span class="section-index">03</span><div><h2>模型连接</h2><p>默认连接本机 FreeLLMAPI，也可换成其他 OpenAI 兼容服务。</p></div></div>
             </div>
-            <div class="model-presets">
-              <button class="preset active" data-base="http://127.0.0.1:3001/v1" data-model="auto">FreeLLMAPI</button>
-              <button class="preset" data-base="http://127.0.0.1:11434/v1" data-model="qwen3:14b">Ollama</button>
-              <button class="preset" data-base="https://api.openai.com/v1" data-model="gpt-4o-mini">OpenAI</button>
-              <button class="preset" data-base="" data-model="">自定义</button>
-            </div>
+            <div class="model-presets" id="providerPresets"></div>
+            <p class="preset-note" id="presetNote">默认连接本机 FreeLLMAPI，模型可填 auto / auto:smart / auto:fast。</p>
             <label class="field full"><span>Base URL</span><input id="baseUrl" type="url" value="http://127.0.0.1:3001/v1" spellcheck="false"></label>
             <div class="form-grid">
-              <label class="field"><span>模型</span><input id="modelName" value="auto" spellcheck="false"></label>
+              <label class="field"><span>模型</span><input id="modelName" value="auto" list="modelOptions" spellcheck="false"><datalist id="modelOptions"></datalist></label>
               <label class="field"><span>API Key</span><input id="apiKey" type="password" autocomplete="off" placeholder="FreeLLM 仪表盘密钥"></label>
             </div>
             <div class="inline-actions">
               <button class="button secondary" id="testProviderButton">测试连接</button>
+              <button class="button secondary" id="fetchModelsButton">拉取模型列表</button>
               <span class="inline-status" id="providerTestStatus">尚未测试</span>
             </div>
-            <label class="field full"><span>FreeLLM 启动脚本</span><input id="launcherPath" value="C:\Users\12196\Desktop\FreeLLMAPI 启动器.vbs" spellcheck="false"></label>
+            <label class="field full"><span>FreeLLM 启动脚本</span><input id="launcherPath" spellcheck="false"></label>
           </section>
 
           <section class="card">
@@ -153,9 +150,43 @@
           </section>
         </section>
 
+        <section class="card hidden" id="glossaryCard">
+          <div class="section-heading">
+            <div><span class="section-index">05</span><div><h2>世界观词表</h2><p>把人名、称谓、功法、地点、势力和术语固定下来，避免模型把专名“改成常见词”。</p></div></div>
+            <span class="mini-tag" id="glossaryCount">0 条</span>
+          </div>
+
+          <div class="glossary-summary">
+            <div class="metric-inline"><span>手动/自动</span><strong id="glossarySourceSplit">0 / 0</strong></div>
+            <div class="metric-inline"><span>注入状态</span><strong id="glossaryInjectState">已启用</strong></div>
+            <div class="metric-inline"><span>提取范围</span><strong id="glossaryExtractScope">按当前章节范围</strong></div>
+          </div>
+
+          <div class="toggle-row">
+            <label class="switch"><input type="checkbox" id="useGlossary" checked><span>校对时注入词表</span></label>
+            <label class="switch"><input type="checkbox" id="glossaryAutoGrow"><span>自升级反馈（默认关闭）</span></label>
+            <label class="switch"><input type="checkbox" id="useWebSearch"><span>提取时联网增强</span></label>
+          </div>
+          <p class="toggle-hint">自升级反馈：模型在批次中发现新的关键专名时自动写入词表，并在报告中列出来源章节；属于扩展功能，默认不启动。</p>
+
+          <div class="inline-actions">
+            <button class="button secondary" id="extractGlossaryButton">自动提取词表</button>
+            <button class="button secondary" id="saveGlossaryButton">保存词表</button>
+            <button class="button ghost compact" id="toggleGlossaryJson">编辑 JSON</button>
+            <span class="inline-status" id="glossaryStatus">未提取</span>
+          </div>
+
+          <div class="glossary-chips" id="glossaryChips"></div>
+
+          <div class="glossary-editor hidden" id="glossaryEditorWrap">
+            <textarea id="glossaryEditor" class="rules-editor glossary-text" spellcheck="false"></textarea>
+            <div class="editor-footer"><span>JSON 格式：entries[].name / type / aliases / note</span><span>可手动增删</span></div>
+          </div>
+        </section>
+
         <section class="card hidden" id="rulesCard">
           <div class="section-heading compact-heading">
-            <div><span class="section-index">05</span><div><h2>校对规则</h2><p>这里的规则会随每个批次发送。建议写清“可以改什么、绝不能改什么”。</p></div></div>
+            <div><span class="section-index">06</span><div><h2>校对规则</h2><p>这里的规则会随每个批次发送。建议写清“可以改什么、绝不能改什么”。</p></div></div>
             <div class="rule-actions"><button class="button ghost compact" id="resetRulesButton">恢复推荐规则</button></div>
           </div>
           <textarea id="rulesEditor" class="rules-editor" spellcheck="false"></textarea>
@@ -187,6 +218,10 @@
             </div>
           </div>
           <div class="log-panel" id="logPanel"></div>
+          <div class="review-section">
+            <div class="section-heading compact-heading"><div><div><h2>章节对比</h2><p>已完成的章节可随时查看；红色为删除，绿色为新增。</p></div></div></div>
+            <div id="reviewList" class="review-list"><span>完成章节后显示在这里。</span></div>
+          </div>
           <div class="result-panel hidden" id="resultPanel">
             <div><span class="result-check">完成</span><div><strong>校对版已合并并自动导出</strong><small id="resultDescription">TXT 与处理报告已生成。</small></div></div>
             <div class="inline-actions"><a class="button primary" id="downloadTextLink" href="#">下载校对版 TXT</a><a class="button secondary" id="downloadReportLink" href="#">下载报告</a></div>
@@ -202,6 +237,14 @@
   </div>
 
   <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <dialog id="compareDialog" class="compare-dialog" aria-labelledby="compareHeading">
+    <div class="compare-header"><div><h2 id="compareHeading">章节对比</h2><p id="compareStats"></p><p id="compareNote"></p></div><button class="button secondary compact" id="closeCompare">关闭</button></div>
+    <div class="compare-grid">
+      <section><h3>校对前 <span>删除部分</span></h3><div id="compareBefore" class="compare-text"></div></section>
+      <section><h3>校对后 <span>新增部分</span></h3><div id="compareAfter" class="compare-text"></div></section>
+    </div>
+  </dialog>
+  <script src="/diff.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
