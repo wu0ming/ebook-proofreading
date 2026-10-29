@@ -7,7 +7,7 @@ Dim fso, sh, ps1
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh  = CreateObject("WScript.Shell")
 
-ps1 = "C:\Users\12196\freellmapi\launcher.ps1"
+ps1 = sh.ExpandEnvironmentStrings("%USERPROFILE%\freellmapi\launcher.ps1")
 
 If Not fso.FileExists(ps1) Then
     MsgBox "Launcher script not found:" & vbCrLf & ps1, 16, "FreeLLMAPI"

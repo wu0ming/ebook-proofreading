@@ -55,6 +55,25 @@ const elements = {
   rulesEditor: $('#rulesEditor'),
   rulesCount: $('#rulesCount'),
   resetRulesButton: $('#resetRulesButton'),
+  providerPresets: $('#providerPresets'),
+  presetNote: $('#presetNote'),
+  fetchModelsButton: $('#fetchModelsButton'),
+  modelOptions: $('#modelOptions'),
+  glossaryCard: $('#glossaryCard'),
+  glossaryCount: $('#glossaryCount'),
+  glossarySourceSplit: $('#glossarySourceSplit'),
+  glossaryInjectState: $('#glossaryInjectState'),
+  glossaryExtractScope: $('#glossaryExtractScope'),
+  useGlossary: $('#useGlossary'),
+  glossaryAutoGrow: $('#glossaryAutoGrow'),
+  useWebSearch: $('#useWebSearch'),
+  extractGlossaryButton: $('#extractGlossaryButton'),
+  saveGlossaryButton: $('#saveGlossaryButton'),
+  toggleGlossaryJson: $('#toggleGlossaryJson'),
+  glossaryStatus: $('#glossaryStatus'),
+  glossaryChips: $('#glossaryChips'),
+  glossaryEditorWrap: $('#glossaryEditorWrap'),
+  glossaryEditor: $('#glossaryEditor'),
   jobSummary: $('#jobSummary'),
   startJobButton: $('#startJobButton'),
   progressSubtitle: $('#progressSubtitle'),
@@ -71,6 +90,14 @@ const elements = {
   resultDescription: $('#resultDescription'),
   downloadTextLink: $('#downloadTextLink'),
   downloadReportLink: $('#downloadReportLink'),
+  reviewList: $('#reviewList'),
+  compareDialog: $('#compareDialog'),
+  compareHeading: $('#compareHeading'),
+  compareStats: $('#compareStats'),
+  compareNote: $('#compareNote'),
+  compareBefore: $('#compareBefore'),
+  compareAfter: $('#compareAfter'),
+  closeCompare: $('#closeCompare'),
   toastRegion: $('#toastRegion'),
 };
 
@@ -145,9 +172,163 @@ async function initialize() {
   elements.chaptersPerBatch.value = state.defaults.batching.chaptersPerBatch;
   elements.concurrency.value = state.defaults.batching.concurrency;
   elements.maxCharsPerBatch.value = state.defaults.batching.maxCharsPerBatch;
+  renderProviderPresets();
+  setGlossary(state.defaults.glossary);
   updateRuleCount();
   updateBatchVisual();
   await checkFreeLlm();
+}
+
+function renderProviderPresets() {
+  const presets = state.defaults?.providerPresets?.presets || [];
+  elements.providerPresets.innerHTML = presets.map((preset, index) => `
+    <button class="preset${index === 0 ? ' active' : ''}" data-base="${escapeHtml(preset.baseUrl)}" data-model="${escapeHtml(preset.model)}" data-note="${escapeHtml(preset.note || '')}">${escapeHtml(preset.label)}</button>`).join('');
+  elements.presetNote.textContent = presets.find((preset) => preset.id === 'freellm')?.note
+    || '默认连接本机 FreeLLMAPI，模型可填 auto / auto:smart / auto:fast。';
+  $$('#providerPresets .preset').forEach((button) => button.addEventListener('click', () => {
+    $$('#providerPresets .preset').forEach((item) => item.classList.remove('active'));
+    button.classList.add('active');
+    elements.baseUrl.value = button.dataset.base;
+    elements.modelName.value = button.dataset.model;
+    if (button.dataset.note) elements.presetNote.textContent = button.dataset.note;
+  }));
+}
+
+function normalizeGlossaryInput(value) {
+  let parsed = value;
+  if (typeof value === 'string') {
+    try {
+      parsed = JSON.parse(value || '{"version":1,"entries":[]}');
+    } catch {
+      throw new Error('词表 JSON 格式无效，请检查后重试。');
+    }
+  }
+  const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+  return {
+    version: 1,
+    entries: entries.map((entry) => ({
+      name: String(entry?.name || '').trim(),
+      type: ['character', 'term', 'place', 'organization'].includes(entry?.type) ? entry.type : 'term',
+      aliases: Array.isArray(entry?.aliases) ? entry.aliases.filter(Boolean) : [],
+      note: String(entry?.note || ''),
+      source: entry?.source === 'auto' ? 'auto' : 'manual',
+      originChapter: Number(entry?.originChapter) || null,
+    })).filter((entry) => entry.name),
+  };
+}
+
+function setGlossary(glossary) {
+  state.glossary = normalizeGlossaryInput(glossary);
+  renderGlossary();
+}
+
+function renderGlossary() {
+  const glossary = state.glossary || { entries: [] };
+  elements.glossaryCard.classList.remove('hidden');
+  elements.glossaryCount.textContent = `${formatNumber(glossary.entries.length)} 条`;
+  const manual = glossary.entries.filter((entry) => entry.source !== 'auto').length;
+  elements.glossarySourceSplit.textContent = `${formatNumber(manual)} / ${formatNumber(glossary.entries.length - manual)}`;
+  elements.glossaryInjectState.textContent = elements.useGlossary.checked ? '已启用' : '已停用';
+  elements.glossaryEditor.value = JSON.stringify(glossary, null, 2);
+  elements.glossaryChips.innerHTML = glossary.entries.slice(0, 60).map((entry) => {
+    const label = `${entry.name}${entry.aliases?.length ? ` · ${entry.aliases.slice(0, 3).join('、')}` : ''}`;
+    return `<span class="chip${entry.source === 'auto' ? ' auto' : ''}" title="${escapeHtml(entry.note || '')}"><b>${escapeHtml(label)}</b></span>`;
+  }).join('') || '<span class="chip">暂无词条</span>';
+}
+
+async function loadSavedGlossary(documentId) {
+  try {
+    const result = await api(`/api/glossary?documentId=${encodeURIComponent(documentId)}`, { method: 'GET', headers: {} });
+    if (result.glossary?.entries?.length) {
+      setGlossary(result.glossary);
+      elements.glossaryStatus.textContent = '已载入已保存词表';
+      elements.glossaryStatus.className = 'inline-status success';
+    }
+  } catch {
+    // 没有已保存词表时保持默认词表即可。
+  }
+}
+
+async function extractGlossary() {
+  if (!state.document) {
+    toast('请先导入 TXT 文件。', 'error');
+    return;
+  }
+  let glossary;
+  try {
+    glossary = normalizeGlossaryInput(elements.glossaryEditor.value);
+  } catch (error) {
+    toast(error.message, 'error');
+    return;
+  }
+  elements.extractGlossaryButton.disabled = true;
+  elements.glossaryStatus.textContent = '正在聚合章节并提取词表…';
+  elements.glossaryStatus.className = 'inline-status';
+  try {
+    const result = await api('/api/glossary/extract', {
+      method: 'POST',
+      body: JSON.stringify({
+        documentId: state.document.id,
+        start: Number(elements.startChapter.value),
+        end: Number(elements.endChapter.value),
+        charLimit: state.defaults.glossaryOptions?.extractionCharLimit || 120000,
+        useWebSearch: elements.useWebSearch.checked,
+        glossary,
+        provider: providerPayload(),
+      }),
+    });
+    setGlossary(result.glossary);
+    elements.glossaryStatus.textContent = `新增 ${result.added} 条，扫描 ${result.scannedChapters} 章`;
+    elements.glossaryStatus.className = 'inline-status success';
+    toast(`词表提取完成：新增 ${result.added} 条，共 ${result.glossary.entries.length} 条。`, 'success');
+  } catch (error) {
+    elements.glossaryStatus.textContent = '提取失败';
+    elements.glossaryStatus.className = 'inline-status error';
+    toast(error.message, 'error', 7000);
+  } finally {
+    elements.extractGlossaryButton.disabled = false;
+  }
+}
+
+async function saveGlossary() {
+  if (!state.document) {
+    toast('请先导入 TXT 文件。', 'error');
+    return;
+  }
+  try {
+    const glossary = normalizeGlossaryInput(elements.glossaryEditor.value);
+    state.glossary = glossary;
+    const result = await api('/api/glossary/save', {
+      method: 'POST',
+      body: JSON.stringify({ documentId: state.document.id, glossary }),
+    });
+    renderGlossary();
+    elements.glossaryStatus.textContent = `已保存 ${result.entryCount} 条`;
+    elements.glossaryStatus.className = 'inline-status success';
+    toast('词表已保存到工作台。', 'success');
+  } catch (error) {
+    toast(error.message, 'error');
+  }
+}
+
+async function fetchModels() {
+  elements.fetchModelsButton.disabled = true;
+  elements.providerTestStatus.textContent = '正在拉取模型列表…';
+  elements.providerTestStatus.className = 'inline-status';
+  try {
+    const result = await api('/api/provider/models', { method: 'POST', body: JSON.stringify(providerPayload()) });
+    const models = result.models || [];
+    elements.modelOptions.innerHTML = models.map((model) => `<option value="${escapeHtml(model)}"></option>`).join('');
+    elements.providerTestStatus.textContent = models.length ? `发现 ${models.length} 个模型` : '接口可用但未返回模型列表';
+    elements.providerTestStatus.className = 'inline-status success';
+    if (!models.length) toast('接口可连通，但没有返回模型列表；可手动填写模型名。', 'info');
+  } catch (error) {
+    elements.providerTestStatus.textContent = '拉取失败';
+    elements.providerTestStatus.className = 'inline-status error';
+    toast(error.message, 'error', 7000);
+  } finally {
+    elements.fetchModelsButton.disabled = false;
+  }
 }
 
 async function readTextFile(file) {
@@ -193,6 +374,7 @@ async function analyzeFile(file) {
     });
     state.document = documentInfo;
     renderAnalysis(documentInfo);
+    await loadSavedGlossary(documentInfo.id);
     elements.analysisState.textContent = '分析完成';
     elements.analysisState.className = 'analysis-state done';
     elements.startJobButton.disabled = false;
@@ -259,9 +441,13 @@ function updateRangeSummary() {
   const chars = chapters.reduce((sum, chapter) => sum + chapter.chars, 0);
   elements.selectedCount.textContent = `${formatNumber(chapters.length)} 章`;
   elements.selectedChars.textContent = `约 ${formatNumber(chars)} 字符`;
+  elements.glossaryExtractScope.textContent = chapters.length
+    ? `第 ${elements.startChapter.value}-${elements.endChapter.value} 章`
+    : '按当前章节范围';
   const mode = document.querySelector('input[name="mode"]:checked')?.value === 'rules' ? '仅规则整理' : '模型智能校对';
+  const glossaryHint = elements.useGlossary.checked ? ` · 词表 ${state.glossary?.entries?.length || 0} 条` : ' · 未注入词表';
   const batches = Math.max(1, Math.ceil(chapters.length / Math.max(1, Number(elements.chaptersPerBatch.value))));
-  elements.jobSummary.textContent = `${mode} · 第 ${elements.startChapter.value}-${elements.endChapter.value} 章 · 约 ${batches} 批 · 完成后自动合并导出。`;
+  elements.jobSummary.textContent = `${mode} · 第 ${elements.startChapter.value}-${elements.endChapter.value} 章 · 约 ${batches} 批${glossaryHint} · 完成后自动合并导出。`;
 }
 
 function updateBatchVisual() {
@@ -347,6 +533,14 @@ async function startJob() {
     toast('请填写模型 Base URL。', 'error');
     return;
   }
+  let glossary;
+  try {
+    glossary = normalizeGlossaryInput(elements.glossaryEditor.value);
+  } catch (error) {
+    toast(error.message, 'error');
+    return;
+  }
+  state.glossary = glossary;
 
   elements.startJobButton.disabled = true;
   elements.resultPanel.classList.add('hidden');
@@ -362,6 +556,9 @@ async function startJob() {
         concurrency: Number(elements.concurrency.value),
         maxCharsPerBatch: Number(elements.maxCharsPerBatch.value),
         rules: elements.rulesEditor.value,
+        useGlossary: elements.useGlossary.checked,
+        glossaryAutoGrow: elements.glossaryAutoGrow.checked,
+        glossary,
         provider: providerPayload(),
       }),
     });
@@ -410,6 +607,10 @@ function renderJob(job) {
   elements.progressBar.style.width = `${job.progress}%`;
   elements.progressChapterLabel.textContent = `${formatNumber(job.completedChapters)} / ${formatNumber(job.totalChapters)} 章`;
   elements.progressBatchLabel.textContent = `${formatNumber(job.completedBatches)} / ${formatNumber(job.totalBatches)} 批`;
+  const reviewHtml = (job.reviewedChapters || []).map((chapter) =>
+    `<button class="review-chapter" data-number="${chapter.number}"><strong>第 ${chapter.number} 章</strong><span>${escapeHtml(chapter.title || '未命名')}</span>${chapter.fallback ? '<em>规则回退</em>' : ''}</button>`
+  ).join('') || '<span>完成章节后显示在这里。</span>';
+  if (elements.reviewList.innerHTML !== reviewHtml) elements.reviewList.innerHTML = reviewHtml;
 
   const laneCount = Math.max(1, job.config.concurrency);
   const lanes = Array.from({ length: laneCount }, (_, index) => job.activeBatches.find((item) => item.worker === index + 1));
@@ -423,6 +624,11 @@ function renderJob(job) {
     return `<div class="log-row ${escapeHtml(log.level)}"><time>${time}</time><span class="level">${escapeHtml(log.level)}</span><span>${escapeHtml(log.message)}</span></div>`;
   }).join('');
   elements.logPanel.scrollTop = elements.logPanel.scrollHeight;
+
+  if (job.glossary?.autoAddedEntries?.length) {
+    const chips = job.glossary.autoAddedEntries.slice(-12).map((entry) => `<span class="chip auto"><b>${escapeHtml(entry.name)}</b> · 第 ${entry.chapter} 章</span>`).join('');
+    elements.logPanel.insertAdjacentHTML('beforeend', `<div class="log-row"><time>词表</time><span class="level">AUTO</span><span>自升级新增：${chips}</span></div>`);
+  }
 
   elements.pauseJobButton.disabled = !['running', 'paused'].includes(job.status);
   elements.pauseJobButton.textContent = job.status === 'paused' ? '继续' : '暂停';
@@ -442,6 +648,31 @@ function renderJob(job) {
     elements.startJobButton.disabled = false;
     toast('任务已取消，已完成结果保留在当前会话。', 'info');
   }
+}
+
+async function openComparison(number) {
+  const jobId = state.job?.id;
+  if (!jobId) return;
+  try {
+    const chapter = await api(`/api/jobs/${encodeURIComponent(jobId)}/chapter?number=${encodeURIComponent(number)}`, { method: 'GET', headers: {} });
+    if (state.job?.id !== jobId) return;
+    const beforeCount = Array.from(chapter.before.body).length;
+    const afterCount = Array.from(chapter.after.body).length;
+    const delta = afterCount - beforeCount;
+    elements.compareHeading.textContent = `第 ${chapter.number} 章 · 校对前后`;
+    elements.compareStats.textContent = `正文：校对前 ${formatNumber(beforeCount)} 字符 · 校对后 ${formatNumber(afterCount)} 字符 · ${delta >= 0 ? '+' : '−'}${formatNumber(Math.abs(delta))} 字符（含空格和换行）`;
+    elements.compareNote.textContent = `${chapter.fallback ? '模型校对失败，此章展示规则清理回退结果。' : '红色标出删除内容，绿色标出新增内容。'} 校对前为拆章后的原文，拆章前已清除的已知混入内容不在此对比中。`;
+    const renderDiff = (before, after) => {
+      const parts = compareText(before, after);
+      return ['before', 'after'].map((side) => parts.filter((part) => part.type === 'same' || part.type === (side === 'before' ? 'removed' : 'added'))
+        .map((part) => part.type === 'same' ? escapeHtml(part.value) : `<mark class="${part.type}">${escapeHtml(part.value)}</mark>`).join(''));
+    };
+    const titles = renderDiff(chapter.before.title, chapter.after.title);
+    const bodies = renderDiff(chapter.before.body, chapter.after.body);
+    elements.compareBefore.innerHTML = `<strong>${titles[0]}</strong>\n\n${bodies[0]}`;
+    elements.compareAfter.innerHTML = `<strong>${titles[1]}</strong>\n\n${bodies[1]}`;
+    if (!elements.compareDialog.open) elements.compareDialog.showModal();
+  } catch (error) { toast(`无法打开章节：${error.message}`, 'error'); }
 }
 
 async function pauseOrResumeJob() {
@@ -486,22 +717,32 @@ function bindEvents() {
   [elements.chaptersPerBatch, elements.concurrency, elements.maxCharsPerBatch].forEach((input) => input.addEventListener('input', updateBatchVisual));
   $$('input[name="mode"]').forEach((input) => input.addEventListener('change', updateRangeSummary));
   elements.rulesEditor.addEventListener('input', updateRuleCount);
+  elements.fetchModelsButton.addEventListener('click', fetchModels);
+  elements.extractGlossaryButton.addEventListener('click', extractGlossary);
+  elements.saveGlossaryButton.addEventListener('click', saveGlossary);
+  elements.toggleGlossaryJson.addEventListener('click', () => {
+    const hidden = elements.glossaryEditorWrap.classList.toggle('hidden');
+    elements.toggleGlossaryJson.textContent = hidden ? '编辑 JSON' : '收起 JSON';
+  });
+  [elements.useGlossary, elements.glossaryAutoGrow].forEach((input) => input.addEventListener('change', () => {
+    renderGlossary();
+    updateRangeSummary();
+  }));
   elements.resetRulesButton.addEventListener('click', () => {
     elements.rulesEditor.value = state.defaults.rules;
     updateRuleCount();
     toast('已恢复推荐校对规则。', 'success');
   });
-  $$('.preset').forEach((button) => button.addEventListener('click', () => {
-    $$('.preset').forEach((item) => item.classList.remove('active'));
-    button.classList.add('active');
-    elements.baseUrl.value = button.dataset.base;
-    elements.modelName.value = button.dataset.model;
-  }));
   elements.testProviderButton.addEventListener('click', testProvider);
   elements.startFreeLlmButton.addEventListener('click', startFreeLlm);
   elements.startJobButton.addEventListener('click', startJob);
   elements.pauseJobButton.addEventListener('click', pauseOrResumeJob);
   elements.cancelJobButton.addEventListener('click', cancelJob);
+  elements.reviewList.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-number]');
+    if (button) openComparison(button.dataset.number);
+  });
+  elements.closeCompare.addEventListener('click', () => elements.compareDialog.close());
 }
 
 bindEvents();
