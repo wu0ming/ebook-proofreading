@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>电子书校对</title>
+  <title>电子说校对工作台</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -14,7 +14,7 @@
         <div class="brand-mark">砚</div>
         <div>
           <p class="eyebrow">LOCAL NOVEL PROOFREADING</p>
-          <h1>电子书校对</h1>
+          <h1>电子说校对工作台</h1>
         </div>
       </div>
       <div class="topbar-actions">
@@ -39,11 +39,25 @@
         </ol>
         <div class="safety-note">
           <span class="safety-icon">只读</span>
-          <div><strong>不会覆盖源 TXT</strong><p>失败章节会保留规则清理版，并写入报告。</p></div>
+          <div><strong>不会覆盖源 TXT</strong><p>失败章节可选择规则回退，或留待重试。</p></div>
         </div>
       </aside>
 
       <section class="content">
+        <section class="card hidden resume-card" id="resumeCard">
+          <div>
+            <span class="section-index live">续</span>
+            <div>
+              <h2 id="resumeTitle">发现未完成的任务</h2>
+              <p id="resumeDescription">工作台重启后会自动载入上次中断的进度。</p>
+            </div>
+          </div>
+          <div class="inline-actions">
+            <button class="button primary compact" id="resumeJobButton">继续该任务</button>
+            <button class="button ghost compact" id="discardJobButton">放弃</button>
+          </div>
+        </section>
+
         <section class="hero-card card">
           <div>
             <p class="eyebrow">SMART CHAPTER PIPELINE</p>
@@ -115,15 +129,18 @@
             <p class="preset-note" id="presetNote">默认连接本机 FreeLLMAPI，模型可填 auto / auto:smart / auto:fast。</p>
             <label class="field full"><span>Base URL</span><input id="baseUrl" type="url" value="http://127.0.0.1:3001/v1" spellcheck="false"></label>
             <div class="form-grid">
-              <label class="field"><span>模型</span><input id="modelName" value="auto" list="modelOptions" spellcheck="false"><datalist id="modelOptions"></datalist></label>
+              <label class="field"><span>模型</span><input id="modelName" value="auto" list="modelOptions" spellcheck="false" placeholder="auto 或 deepseek-v4-flash, glm-4.7-flash"><datalist id="modelOptions"></datalist></label>
               <label class="field"><span>API Key</span><input id="apiKey" type="password" autocomplete="off" placeholder="FreeLLM 仪表盘密钥"></label>
             </div>
+            <p class="toggle-hint">模型可填多个，用英文逗号分隔，按顺序自动切换（如 <code>deepseek-v4-flash, glm-4.7-flash, qwen3.5-plus</code>）：遇到限流或上游故障时自动换下一个，全部不可用时进入自动补偿队列。</p>
             <div class="inline-actions">
               <button class="button secondary" id="testProviderButton">测试连接</button>
               <button class="button secondary" id="fetchModelsButton">拉取模型列表</button>
               <span class="inline-status" id="providerTestStatus">尚未测试</span>
             </div>
             <label class="field full"><span>FreeLLM 启动脚本</span><input id="launcherPath" spellcheck="false"></label>
+            <div class="inline-actions"><button class="button secondary" id="saveConnectionButton">保存模型配置到本机</button><button class="button ghost compact" id="clearConnectionButton">清除已保存配置</button><span class="inline-status" id="connectionSaveStatus">尚未保存</span></div>
+            <p class="toggle-hint">保存后，地址、模型和密钥会留在当前浏览器的本地存储中；密钥不是加密保险箱，使用此浏览器的其他人可能读取。请勿在公用电脑上保存。</p>
           </section>
 
           <section class="card">
@@ -146,6 +163,26 @@
             <div class="mode-switch">
               <label><input type="radio" name="mode" value="llm" checked><span><strong>模型智能校对</strong><small>规则清理后再调用模型</small></span></label>
               <label><input type="radio" name="mode" value="rules"><span><strong>仅规则整理</strong><small>离线快速处理，不调用模型</small></span></label>
+            </div>
+            <label class="switch"><input type="checkbox" id="ruleFallback" checked><span>模型校对失败时使用规则清理版</span></label>
+            <p class="toggle-hint">关闭后，失败章节等待重试；全部章节成功后才导出。开启时可先导出，并在任务结束后重试回退章节。</p>
+            <div class="form-grid three retry-grid">
+              <label class="field"><span>失败自动重试轮数</span><input id="autoRetryRounds" type="number" min="0" max="3" value="1"></label>
+              <div class="field"><span>重试策略</span><div class="static-field" id="retryStrategyHint">自动重试会先完成全批，再把失败章节逐章重发一次；随后进入 5 分钟 / 30 分钟 / 2 小时三级自动补偿。</div></div>
+            </div>
+            <p class="toggle-hint">统一请求调度：全局并发闸门默认 8（初始 3，连续成功逐步升至 10，连续限流自动降）；限流 / 502 / 503 / 504 / 网络错误按指数退避加随机抖动重试并遵守 Retry-After；401 / 403 / 400 立即停止同配置重试。模型可填多个并以逗号分隔，按顺序自动切换。</p>
+            <div class="scheduler-panel" id="schedulerPanel">
+              <div class="section-heading compact-heading">
+                <div><span class="section-index">SYS</span><div><h2>请求调度</h2><p>跨任务共享的全局并发与路由状态。</p></div></div>
+                <span class="mini-tag" id="schedulerState">空闲</span>
+              </div>
+              <div class="scheduler-metrics">
+                <div class="metric-inline"><span>在途请求</span><strong id="schedulerInFlight">0 / 8</strong></div>
+                <div class="metric-inline"><span>动态并发</span><strong id="schedulerLimit">3</strong></div>
+                <div class="metric-inline"><span>成功率</span><strong id="schedulerSuccessRate">—</strong></div>
+                <div class="metric-inline"><span>累计请求</span><strong id="schedulerTotal">0</strong></div>
+              </div>
+              <div class="scheduler-models" id="schedulerModels"><span class="scheduler-empty">暂无请求记录</span></div>
             </div>
           </section>
         </section>
@@ -213,14 +250,26 @@
             <div class="progress-ring" id="progressRing"><strong id="progressPercent">0%</strong><small>完成度</small></div>
             <div class="progress-main">
               <div class="progress-label"><strong id="progressChapterLabel">0 / 0 章</strong><span id="progressBatchLabel">0 / 0 批</span></div>
+              <div class="progress-live" id="progressLive">尚未开始</div>
               <div class="progress-track"><span id="progressBar"></span></div>
               <div class="lane-grid" id="laneGrid"></div>
             </div>
           </div>
           <div class="log-panel" id="logPanel"></div>
+          <div class="inline-actions hidden" id="retryArea"><span id="retrySummary"></span><button class="button secondary" id="retryFailedButton">一键重试失败章节</button></div>
+          <div class="compensation-strip hidden" id="compensationArea"><span class="compensation-dot"></span><span id="compensationSummary"></span></div>
           <div class="review-section">
-            <div class="section-heading compact-heading"><div><div><h2>章节对比</h2><p>已完成的章节可随时查看；红色为删除，绿色为新增。</p></div></div></div>
-            <div id="reviewList" class="review-list"><span>完成章节后显示在这里。</span></div>
+            <div class="section-heading compact-heading">
+              <div><div><h2>章节对比</h2><p>点击任意已完成章节查看校对前后差异；红色为删除，绿色为新增。</p></div></div>
+              <div class="review-filters" id="reviewFilters">
+                <button class="chip-filter active" data-filter="all">全部</button>
+                <button class="chip-filter" data-filter="done">已完成</button>
+                <button class="chip-filter" data-filter="fallback">规则回退</button>
+                <button class="chip-filter" data-filter="pending">未处理</button>
+              </div>
+            </div>
+            <div id="reviewList" class="review-list"><span>开始任务后显示章节状态。</span></div>
+            <div class="review-pager hidden" id="reviewPager"></div>
           </div>
           <div class="result-panel hidden" id="resultPanel">
             <div><span class="result-check">完成</span><div><strong>校对版已合并并自动导出</strong><small id="resultDescription">TXT 与处理报告已生成。</small></div></div>
