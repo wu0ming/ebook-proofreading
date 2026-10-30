@@ -990,7 +990,8 @@ function pendingChapters(job) {
   const failedNumbers = new Set(job.failedChapters.map((item) => item.number));
   const pending = job.cleanedChapters.filter((chapter) => !job.results.has(chapter.number) && !failedNumbers.has(chapter.number));
   const retry = job.cleanedChapters.filter((chapter) => failedNumbers.has(chapter.number));
-  return pending.concat(retry);
+  // 先完成未处理章节；已有失败留给本轮结束后的重试和补偿。
+  return pending.length ? pending : retry;
 }
 
 function resumeJob(job, document, options = {}) {
