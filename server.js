@@ -199,6 +199,13 @@ async function requestChat(messages, config, signal, temperature) {
   const headers = { 'Content-Type': 'application/json' };
   if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
   const payload = { model: config.model, temperature, max_tokens: config.maxTokens, messages };
+  // 星火 MaaS 默认启用深度思考，校对任务按官方接口关闭以减少推理开销。
+  if (new URL(baseUrl).hostname === 'maas-api.cn-huabei-1.xf-yun.com' && /^spark-x2\./i.test(config.model)) {
+    payload.thinking = { type: 'disabled' };
+    payload.max_completion_tokens = payload.max_tokens;
+    delete payload.max_tokens;
+    delete payload.temperature;
+  }
   // 单次发送：网络失败与 HTTP 错误统一走调度器错误分类；
   // 400 且属于参数名不支持时，原地做兼容性调整后立即重发（不算退避重试）。
   const send = async () => {
