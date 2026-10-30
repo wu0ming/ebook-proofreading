@@ -173,7 +173,7 @@ function normalizeBaseUrl(value) {
   return String(value || '').trim().replace(/\/+$/, '');
 }
 
-async function fetchWithTimeout(url, options, timeoutMs, parentSignal) {
+async function fetchWithTimeout(url, options, timeoutMs, parentSignal, readBody = false) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(new Error('请求超时')), timeoutMs);
   const abortFromParent = () => controller.abort(parentSignal.reason || new Error('任务已取消'));
@@ -182,7 +182,11 @@ async function fetchWithTimeout(url, options, timeoutMs, parentSignal) {
     else parentSignal.addEventListener('abort', abortFromParent, { once: true });
   }
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    return readBody ? { response, text: await response.text() } : response;
+  } catch (error) {
+    if (controller.signal.aborted) throw controller.signal.reason || error;
+    throw error;
   } finally {
     clearTimeout(timeout);
     if (parentSignal) parentSignal.removeEventListener('abort', abortFromParent);
@@ -202,8 +206,7 @@ async function requestChat(messages, config, signal, temperature) {
       let response;
       let text;
       try {
-        response = await fetchWithTimeout(`${baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(payload) }, config.timeoutMs, signal);
-        text = await response.text();
+        ({ response, text } = await fetchWithTimeout(`${baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(payload) }, config.timeoutMs, signal, true));
       } catch (error) {
         if (signal?.aborted) throw error;
         throw new SchedulerError(`模型网络请求失败：${error.message}`, { kind: 'network', retryable: true, model: config.model });
