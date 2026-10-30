@@ -70,6 +70,11 @@ test('规则回退可关闭，失败章节可重试且保留其他章节', { tim
     assert.deepEqual(compatibilityRequests.map((r) => 'max_tokens' in r ? 'old' : 'temperature' in r ? 'new' : 'default'), ['old', 'new', 'default', 'old', 'new', 'default']);
     await assert.rejects(req('/api/glossary/extract', { documentId: doc.id, start: 1, end: 1, provider: { ...compatProvider, model: 'other-error' } }), /unknown model/);
     assert.equal(compatibilityRequests.filter((r) => r.model === 'other-error').length, 1);
+    const fatalJob = await req('/api/jobs', { ...config, concurrency: 1, provider: { ...compatProvider, model: 'other-error' } });
+    const fatal = await done(fatalJob.id);
+    assert.equal(fatal.status, 'failed');
+    assert.match(fatal.error, /HTTP 400/);
+    assert.equal(compatibilityRequests.filter((r) => r.model === 'other-error').length, 2, '参数错误应停止整个任务，而不是对每章重复请求');
   } finally {
     if (server.exitCode === null) { server.kill(); await new Promise((resolve) => server.once('exit', resolve)); }
     await new Promise((resolve) => model.close(resolve)); fs.rmSync(root, { recursive: true, force: true });

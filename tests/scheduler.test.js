@@ -30,6 +30,9 @@ test('错误分类：遵守 Retry-After 头与响应体 retryAtMs', () => {
   const byBody = classifyHttpError(429, JSON.stringify({ retryAtMs: future }), null, 'm');
   assert.ok(byBody.retryAfterMs > 50000 && byBody.retryAfterMs <= 60000, '应从响应体解析 retryAtMs');
 
+  const freePool = classifyHttpError(429, JSON.stringify({ error: { message: 'Soonest cooldown reset ~89s.' } }), null, 'm');
+  assert.equal(freePool.retryAfterMs, 89000);
+
   const noHint = classifyHttpError(502, 'bad gateway', null, 'm');
   assert.equal(noHint.retryAfterMs, null);
 });
@@ -177,4 +180,49 @@ test('SchedulerError 携带分类信息', () => {
   assert.equal(error.retryable, true);
   assert.equal(error.model, 'm1');
   assert.equal(error.status, null);
+});
+
+test('onRetry 可覆盖等待时长：模型链轮换后立即重试', async () => {
+  // 429 带 8 秒 Retry-After，但 onRetry 返回 0（刚切换到新模型，旧冷却不适用）→ 实际不等待
+  const gate = new RequestScheduler({ maxGlobal: 2, initialConcurrency: 2, backoffBaseMs: 10, retryAfterCapMs: 60000, maxAttempts: 2 });
+  const waits = [];
+  const started = Date.now();
+  await gate.run(async () => {
+    throw classifyHttpError(429, '{}', '8', 'mock');
+  }, {
+    model: 'mock',
+    onRetry: (attempt, error, delay) => { waits.push({ attempt, delay }); return 0; },
+  }).catch(() => 'failed');
+  assert.equal(waits.length, 1);
+  assert.equal(waits[0].delay, 8000, '调度器计算的等待应仍是 8 秒');
+  assert.ok(Date.now() - started < 1000, `覆盖为 0 后应立即重试，实际耗时 ${Date.now() - started}ms`);
+});
+
+test('onRetry 返回非数字时按调度器等待执行', async () => {
+  const gate = new RequestScheduler({ maxGlobal: 2, initialConcurrency: 2, backoffBaseMs: 10, retryAfterCapMs: 60000, maxAttempts: 2 });
+  const waits = [];
+  const started = Date.now();
+  await gate.run(async () => {
+    throw classifyHttpError(429, '{}', '2', 'mock');
+  }, {
+    model: 'mock',
+    onRetry: (attempt, error, delay) => { waits.push(delay); return null; },
+  }).catch(() => 'failed');
+  assert.equal(waits[0], 2000, '无覆盖时应遵守 Retry-After');
+  assert.ok(Date.now() - started >= 1900, `应实际等待约 2 秒，实际 ${Date.now() - started}ms`);
+});
+
+
+test('退避等待不占用全局请求名额', async () => {
+  const gate = new RequestScheduler({ maxGlobal: 1, initialConcurrency: 1, maxConcurrency: 1, backoffBaseMs: 100 });
+  let retried = false;
+  let waiting;
+  const retryScheduled = new Promise((resolve) => { waiting = resolve; });
+  const first = gate.run(async (attempt) => {
+    if (attempt === 1) throw new SchedulerError('temporary', { status: 503, retryable: true });
+    retried = true;
+  }, { onRetry: () => { waiting(); return 300; } });
+  await retryScheduled;
+  await gate.run(async () => assert.equal(retried, false), { maxAttempts: 1 });
+  await first;
 });

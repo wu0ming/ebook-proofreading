@@ -91,14 +91,10 @@ test('任务中断后重启工作台可载入进度并继续', { timeout: 90000 
     assert.equal(resumable.jobs[0].id, jobId);
     assert.equal(resumable.jobs[0].completedChapters, 3, '应记住已完成的 3 章（其中第 3 章为回退）');
 
-    const document = await (await fetch(`${second.base}/api/documents/analyze`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ fileName: '测试.txt', text }),
-    })).json();
-
     const resumed = await (await fetch(`${second.base}/api/jobs/${encodeURIComponent(jobId)}/resume`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ documentId: document.id, provider: { baseUrl: modelUrl, model: 'mock' } }),
+      body: JSON.stringify({ provider: { baseUrl: modelUrl, model: 'mock' } }),
     })).json();
     assert.equal(resumed.completedChapters >= 3, true);
 

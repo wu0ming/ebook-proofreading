@@ -190,6 +190,7 @@ class RequestScheduler {
       if (signal?.aborted) throw signal.reason || new Error('已取消');
       await this.acquire(signal);
       const startedAt = Date.now();
+      let retryDelay = null;
       try {
         const result = await task(attempt);
         const durationMs = Date.now() - startedAt;
@@ -221,17 +222,24 @@ class RequestScheduler {
         const exponential = Math.min(this.limits.backoffCapMs, this.limits.backoffBaseMs * 2 ** (attempt - 1));
         const jitter = Math.random() * this.limits.backoffBaseMs;
         // 上游明确给出 Retry-After/retryAtMs 时优先遵守（上限 retryAfterCapMs），否则用指数退避加抖动。
-        const delay = retryAfterMs != null
+        let delay = retryAfterMs != null
           ? Math.min(this.limits.retryAfterCapMs, Math.max(1000, retryAfterMs))
           : exponential + jitter;
         this.stats.retried += 1;
         if (onRetry) {
-          try { onRetry(attempt, error, delay); } catch { /* 日志回调失败不影响调度 */ }
+          try {
+            // onRetry 可返回数字覆盖本次等待时长（如模型链刚轮换、旧模型的 Retry-After 不再适用时立即重试）
+            const override = onRetry(attempt, error, delay);
+            if (typeof override === 'number' && Number.isFinite(override)) {
+              delay = Math.max(0, Math.min(this.limits.retryAfterCapMs, override));
+            }
+          } catch { /* 日志回调失败不影响调度 */ }
         }
-        await sleep(delay, signal);
+        retryDelay = delay;
       } finally {
         this.release();
       }
+      if (retryDelay !== null) await sleep(retryDelay, signal);
     }
     throw lastError;
   }
@@ -281,6 +289,8 @@ function extractRetryAtMs(text) {
     const parsed = JSON.parse(text);
     const retryAtMs = parsed?.retryAtMs ?? parsed?.error?.retryAtMs;
     if (Number.isFinite(retryAtMs)) return Math.max(0, retryAtMs - Date.now());
+    const cooldown = String(parsed?.error?.message || '').match(/cooldown reset\s*~?(\d+)s/i);
+    if (cooldown) return Number(cooldown[1]) * 1000;
   } catch { /* 非 JSON，忽略 */ }
   return null;
 }

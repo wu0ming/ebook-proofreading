@@ -18,20 +18,25 @@ const {
 } = require('./core/novel-core');
 const PROVIDER_PRESETS = require('./core/provider-presets.json');
 const DEFAULT_GLOSSARY = require('./core/default-glossary.json');
+const { scheduler, SchedulerError, classifyHttpError } = require('./core/request-scheduler');
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const EXPORT_DIR = path.join(ROOT, 'exports');
 const GLOSSARY_DIR = path.join(ROOT, 'glossaries');
+const JOB_DIR = path.join(ROOT, '.jobs');
 const PORT = Number(process.env.PORT || 3210);
 const HOST = process.env.HOST || '127.0.0.1';
 const DEFAULT_LAUNCHER = path.join(os.homedir(), 'Desktop', 'FreeLLMAPI 启动器.vbs');
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
+// 模型链轮换后的重试等待：旧模型的 Retry-After 冷却不适用于新模型，短暂等待后立即再试
+const MODEL_ROTATE_RETRY_DELAY_MS = Number(process.env.MODEL_ROTATE_RETRY_DELAY_MS || 2000);
 const documents = new Map();
 const jobs = new Map();
 
 fs.mkdirSync(EXPORT_DIR, { recursive: true });
 fs.mkdirSync(GLOSSARY_DIR, { recursive: true });
+fs.mkdirSync(JOB_DIR, { recursive: true });
 
 const DEFAULT_RULES = `你是中文网络小说校对编辑。请在不改动情节、人物关系、世界观、功法名、专有名词和叙事视角的前提下进行校对：
 1. 修正明显错别字、拼音输入错误、形近字和重复字词。
@@ -184,6 +189,48 @@ async function fetchWithTimeout(url, options, timeoutMs, parentSignal) {
   }
 }
 
+async function requestChat(messages, config, signal, temperature) {
+  const baseUrl = normalizeBaseUrl(config.baseUrl);
+  if (!baseUrl) throw Object.assign(new Error('请填写模型 Base URL。'), { statusCode: 400 });
+  const headers = { 'Content-Type': 'application/json' };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  const payload = { model: config.model, temperature, max_tokens: config.maxTokens, messages };
+  // 单次发送：网络失败与 HTTP 错误统一走调度器错误分类；
+  // 400 且属于参数名不支持时，原地做兼容性调整后立即重发（不算退避重试）。
+  const send = async () => {
+    for (let compat = 0; compat < 3; compat += 1) {
+      let response;
+      let text;
+      try {
+        response = await fetchWithTimeout(`${baseUrl}/chat/completions`, { method: 'POST', headers, body: JSON.stringify(payload) }, config.timeoutMs, signal);
+        text = await response.text();
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        throw new SchedulerError(`模型网络请求失败：${error.message}`, { kind: 'network', retryable: true, model: config.model });
+      }
+      if (response.ok) return { response, text };
+      if (response.status !== 400) {
+        throw classifyHttpError(response.status, text, response.headers.get('retry-after'), config.model);
+      }
+      let error;
+      try { error = JSON.parse(text)?.error; } catch { /* 保留原始错误 */ }
+      if ('max_tokens' in payload && error?.param === 'max_tokens' && /max_completion_tokens/i.test(String(error.message || ''))) {
+        delete payload.max_tokens;
+        payload.max_completion_tokens = config.maxTokens;
+        continue;
+      }
+      if ('temperature' in payload && error?.param === 'temperature' && /unsupported|not supported|only the default/i.test(String(error.message || ''))) {
+        delete payload.temperature;
+        continue;
+      }
+      throw classifyHttpError(400, text, response.headers.get('retry-after'), config.model);
+    }
+    throw classifyHttpError(400, '参数兼容性重试次数已用尽', null, config.model);
+  };
+  const result = await send();
+  try { return JSON.parse(result.text); } catch { throw new SchedulerError('模型接口没有返回 OpenAI 兼容 JSON。', { kind: 'parse', retryable: true, model: config.model }); }
+}
+
 async function testProvider(config) {
   const baseUrl = normalizeBaseUrl(config.baseUrl);
   if (!baseUrl) throw Object.assign(new Error('请填写模型 Base URL。'), { statusCode: 400 });
@@ -302,47 +349,26 @@ function buildPrompt(batch, rules, glossary) {
 }
 
 async function callProofreader(batch, config, job) {
-  const baseUrl = normalizeBaseUrl(config.baseUrl);
-  const headers = { 'Content-Type': 'application/json' };
-  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
-  const response = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model: config.model,
-      temperature: 0.1,
-      max_tokens: config.maxTokens,
-      messages: [
+  const envelope = await requestChat([
         {
           role: 'system',
           content: '你是严谨的中文小说校对编辑。只做校对，不改写情节。必须按指定 JSON 结构返回全部章节。',
         },
         { role: 'user', content: buildPrompt(batch, config.rules, config.glossary) },
-      ],
-    }),
-  }, config.timeoutMs, job.controller.signal);
-  const responseText = await response.text();
-  if (!response.ok) throw new Error(`模型请求失败：HTTP ${response.status} - ${responseText.slice(0, 220)}`);
-
-  let envelope;
-  try {
-    envelope = JSON.parse(responseText);
-  } catch {
-    throw new Error('模型接口没有返回 OpenAI 兼容 JSON。');
-  }
+  ], config, job.controller.signal, 0.1);
   const content = envelope?.choices?.[0]?.message?.content;
   const parsed = extractJsonFromModel(content);
-  if (!Array.isArray(parsed.chapters)) throw new Error('模型结果缺少 chapters 数组。');
+  if (!Array.isArray(parsed.chapters)) throw new SchedulerError('模型结果缺少 chapters 数组。', { kind: 'content', retryable: true, model: config.model });
 
   const byId = new Map(parsed.chapters.map((chapter) => [String(chapter.id ?? chapter.number), chapter]));
   return batch.map((sourceChapter) => {
     const candidate = byId.get(String(sourceChapter.number));
     if (!candidate || typeof candidate.content !== 'string') {
-      throw new Error(`模型结果缺少第 ${sourceChapter.number} 章。`);
+      throw new SchedulerError(`模型结果缺少第 ${sourceChapter.number} 章。`, { kind: 'content', retryable: true, model: config.model });
     }
     const candidateLength = candidate.content.trim().length;
     if (candidateLength < Math.max(100, sourceChapter.body.length * 0.55)) {
-      throw new Error(`第 ${sourceChapter.number} 章输出明显过短，已拒绝截断结果。`);
+      throw new SchedulerError(`第 ${sourceChapter.number} 章输出明显过短，已拒绝截断结果。`, { kind: 'content', retryable: true, model: config.model });
     }
     const withoutRepeatedHeader = candidate.content.replace(/^\s*第\s*[0-9０-９零〇一二两三四五六七八九十百千万]+\s*[章回节][^\n]*\n?/, '');
     const cleaned = cleanBody(withoutRepeatedHeader);
@@ -375,28 +401,7 @@ function loadGlossary(documentId) {
 }
 
 async function callModelRaw(messages, config, options = {}) {
-  const baseUrl = normalizeBaseUrl(config.baseUrl);
-  if (!baseUrl) throw Object.assign(new Error('请填写模型 Base URL。'), { statusCode: 400 });
-  const headers = { 'Content-Type': 'application/json' };
-  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
-  const response = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model: config.model,
-      temperature: config.temperature ?? 0.1,
-      max_tokens: config.maxTokens,
-      messages,
-    }),
-  }, config.timeoutMs, options.signal || null);
-  const responseText = await response.text();
-  if (!response.ok) throw new Error(`模型请求失败：HTTP ${response.status} - ${responseText.slice(0, 220)}`);
-  let envelope;
-  try {
-    envelope = JSON.parse(responseText);
-  } catch {
-    throw new Error('模型接口没有返回 OpenAI 兼容 JSON。');
-  }
+  const envelope = await requestChat(messages, config, options.signal || null, config.temperature ?? 0.1);
   return String(envelope?.choices?.[0]?.message?.content || '');
 }
 
@@ -451,7 +456,7 @@ async function extractGlossary(body) {
   saveGlossary(document.id, merged.glossary);
   document.glossary = merged.glossary;
   return {
-    glossary: saved,
+    glossary: merged.glossary,
     added: merged.added,
     modelEntries: parsed.entries.length,
     scannedChapters: excerpt.usedChapters.length,
@@ -465,6 +470,136 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function jobStatePath(jobId) {
+  return path.join(JOB_DIR, `${jobId}.json`);
+}
+
+function persistJob(job) {
+  if (!job?.id) return;
+  const failedMap = new Map(job.failedChapters.map((item) => [item.number, item.error]));
+  const payload = {
+    version: 1,
+    id: job.id,
+    documentId: job.documentId,
+    documentFile: job.fileName,
+    preamble: documents.get(job.documentId)?.preamble ?? job.preamble ?? '',
+    compensationQueue: compensationQueue.filter((item) => item.jobId === job.id).map(({running, ...item}) => item),
+    status: job.status,
+    mode: job.mode,
+    createdAt: job.createdAt,
+    updatedAt: new Date().toISOString(),
+    startedAt: job.startedAt,
+    totalChapters: job.totalChapters,
+    totalBatches: job.totalBatches,
+    completedBatches: job.completedBatches,
+    publicConfig: job.publicConfig,
+    glossary: job.publicConfig.glossary,
+    autoAddedGlossary: job.autoAddedGlossary,
+    failedChapters: job.failedChapters,
+    logs: job.logs.slice(-80),
+    output: job.output ? { textPath: job.output.textPath, reportPath: job.output.reportPath } : null,
+    chapters: job.cleanedChapters.map((chapter) => {
+      const result = job.results.get(chapter.number);
+      return {
+        number: chapter.number,
+        title: chapter.title,
+        resultTitle: result?.title ?? chapter.title,
+        rawBody: chapter.rawBody,
+        sourceBody: chapter.body,
+        body: result?.body ?? '',
+        hasResult: Boolean(result),
+        done: Boolean(result) && !failedMap.has(chapter.number),
+        fallback: failedMap.has(chapter.number),
+        error: failedMap.get(chapter.number) || null,
+      };
+    }),
+  };
+  const filePath = jobStatePath(job.id);
+  const tempPath = `${filePath}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(payload), 'utf8');
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    console.error(`任务进度保存失败：${error.message}`);
+  }
+}
+
+function loadPersistedJobs() {
+  const loaded = [];
+  for (const file of fs.readdirSync(JOB_DIR)) {
+    if (!file.endsWith('.json')) continue;
+    try {
+      const payload = JSON.parse(fs.readFileSync(path.join(JOB_DIR, file), 'utf8'));
+      const failedMap = new Map((payload.failedChapters || []).map((item) => [item.number, item.error]));
+      const cleanedChapters = (payload.chapters || []).map((chapter) => ({
+        number: chapter.number,
+        title: chapter.title,
+        rawBody: chapter.rawBody,
+        // 续跑/重试时作为模型输入：优先用规则清理后的源正文，兼容旧进度文件时退回原始正文。
+        body: chapter.sourceBody ?? chapter.rawBody ?? '',
+        stats: {},
+      }));
+      const job = {
+        id: payload.id,
+        documentId: payload.documentId,
+        fileName: payload.documentFile || '未命名小说.txt',
+        preamble: payload.preamble || '',
+        status: ['completed', 'failed', 'canceled', 'paused'].includes(payload.status) ? payload.status : 'interrupted',
+        mode: payload.mode,
+        createdAt: payload.createdAt,
+        updatedAt: payload.updatedAt,
+        startedAt: payload.startedAt || null,
+        completedAt: null,
+        totalChapters: payload.totalChapters,
+        completedChapters: payload.chapters.filter((chapter) => chapter.hasResult ?? (chapter.done || (chapter.fallback && Boolean(chapter.body)))).length,
+        totalBatches: payload.totalBatches,
+        completedBatches: payload.completedBatches || 0,
+        failedChapters: payload.failedChapters || [],
+        results: new Map(),
+        cleanedChapters,
+        retryPending: new Set(),
+        activeBatches: new Map(),
+        logs: payload.logs || [],
+        output: payload.output && fs.existsSync(payload.output.textPath) ? payload.output : null,
+        error: null,
+        autoAddedGlossary: payload.autoAddedGlossary || [],
+        parseStats: null,
+        publicConfig: payload.publicConfig,
+        secretConfig: { ...payload.publicConfig, apiKey: '' },
+        controller: new AbortController(),
+        resumable: !['completed', 'canceled'].includes(payload.status) || failedMap.size > 0,
+        restored: true,
+      };
+      for (const chapter of payload.chapters || []) {
+        if (!(chapter.hasResult ?? (chapter.done || (chapter.fallback && Boolean(chapter.body))))) continue;
+        job.results.set(chapter.number, {
+          number: chapter.number,
+          title: chapter.resultTitle ?? chapter.title,
+          body: chapter.body || chapter.rawBody,
+          stats: {},
+        });
+      }
+      documents.set(job.documentId, { id: job.documentId, fileName: job.fileName, preamble: job.preamble, chapters: cleanedChapters, warnings: [], stats: {}, glossary: job.publicConfig.glossary });
+      for (const item of payload.compensationQueue || []) {
+        if (job.failedChapters.some((failure) => failure.number === item.number)) compensationQueue.push({ ...item, jobId: job.id, running: false });
+      }
+      jobs.set(job.id, job);
+      loaded.push(job.id);
+    } catch (error) {
+      console.error(`读取任务进度失败（${file}）：${error.message}`);
+    }
+  }
+  return loaded;
+}
+
+function deletePersistedJob(jobId) {
+  try {
+    fs.rmSync(jobStatePath(jobId), { force: true });
+  } catch {
+    // 忽略删除失败，不影响主流程。
+  }
+}
+
 async function waitWhilePaused(job) {
   while (job.status === 'paused' && !job.controller.signal.aborted) await sleep(250);
 }
@@ -475,25 +610,56 @@ function addJobLog(job, message, level = 'info') {
   job.updatedAt = new Date().toISOString();
 }
 
+function modelChain(model) {
+  return String(model || 'auto').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
 async function runModelBatch(batch, job) {
-  let lastError = null;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    if (job.controller.signal.aborted) throw new Error('任务已取消。');
+  const models = modelChain(job.secretConfig.model);
+  if (!models.length) models.push('auto');
+  let modelIndex = 0;
+  // 刚刚因为暂不可用切换了模型：旧模型的 Retry-After 冷却不适用于新模型，缩短等待立即再试
+  let justRotated = false;
+  const rangeLabel = `第 ${batch[0].number}-${batch[batch.length - 1].number} 章`;
+  const currentModel = () => models[Math.min(modelIndex, models.length - 1)];
+  return scheduler.run(async () => {
+    const config = { ...job.secretConfig, model: currentModel() };
     try {
-      return await callProofreader(batch, job.secretConfig, job);
+      return await callProofreader(batch, config, job);
     } catch (error) {
-      lastError = error;
-      if (job.controller.signal.aborted) throw error;
-      const delay = attempt * 1500;
-      addJobLog(job, `第 ${batch[0].number}-${batch[batch.length - 1].number} 章第 ${attempt} 次请求失败：${error.message}`, 'warning');
-      if (attempt < 3) await sleep(delay);
+      // 限流/上游暂不可用 → 切换到模型链上的下一个再试（FreeLLMAPI 免费额度常见）
+      const status = error instanceof SchedulerError ? error.status : null;
+      const rotatable = status === 429 || status === 502 || status === 503 || status === 504
+        || (error instanceof SchedulerError && error.kind === 'network');
+      if (rotatable && modelIndex < models.length - 1) {
+        modelIndex += 1;
+        justRotated = true;
+        addJobLog(job, `${rangeLabel}：模型 ${models[modelIndex - 1]} 暂不可用，切换为 ${models[modelIndex]}。`, 'warning');
+      }
+      throw error;
     }
-  }
-  throw lastError;
+  }, {
+    signal: job.controller.signal,
+    model: models[0],
+    getModel: currentModel,
+    onRetry: (attempt, error, delay) => {
+      // 模型链刚轮换 → 用短延迟覆盖旧模型的 Retry-After；链已耗尽仍不可用 → 按调度器计算的冷却等待
+      const override = justRotated && error.retryAfterMs == null && error.status !== 429 ? MODEL_ROTATE_RETRY_DELAY_MS : null;
+      justRotated = false;
+      addJobLog(job, `${rangeLabel}第 ${attempt} 次请求失败（${String(error.message).slice(0, 120)}），${override != null ? Math.round(override / 1000) : Math.round(delay / 1000)} 秒后${override != null ? '切换模型重试' : '重试'}。`, 'warning');
+      return override;
+    },
+  });
 }
 
 function jobSnapshot(job) {
   const totalChapters = job.totalChapters || 0;
+  const failedNumbers = new Set(job.failedChapters.map((item) => item.number));
+  const succeeded = job.cleanedChapters.filter((chapter) => job.results.has(chapter.number) && !failedNumbers.has(chapter.number));
+  const activeChapters = Array.from(job.activeBatches.values()).flatMap((item) => {
+    const match = String(item.range || '').match(/\d+/g) || [];
+    return match.map(Number);
+  });
   return {
     id: job.id,
     documentId: job.documentId,
@@ -504,18 +670,36 @@ function jobSnapshot(job) {
     updatedAt: job.updatedAt,
     startedAt: job.startedAt,
     completedAt: job.completedAt,
+    restored: Boolean(job.restored),
+    resumable: Boolean(job.resumable) || ['interrupted', 'paused', 'failed'].includes(job.status),
     totalChapters,
     completedChapters: job.completedChapters,
+    succeededChapters: succeeded.length,
+    failedCount: job.failedChapters.length,
     totalBatches: job.totalBatches,
     completedBatches: job.completedBatches,
-    failedChapters: job.failedChapters,
-    progress: totalChapters ? Math.round((job.completedChapters / totalChapters) * 100) : 0,
+    failedChapters: job.failedChapters.slice(-200),
+    compensation: {
+      pending: compensationSnapshotFor(job.id).length,
+      items: compensationSnapshotFor(job.id).slice(0, 50),
+    },
+    progress: totalChapters ? Math.round((succeeded.length / totalChapters) * 100) : 0,
+    currentChapter: activeChapters.length ? Math.max(...activeChapters) : null,
+    latestCompletedChapter: succeeded.length ? Math.max(...succeeded.map((chapter) => chapter.number)) : null,
     activeBatches: Array.from(job.activeBatches.values()),
-    reviewedChapters: Array.from(job.results.values(), (chapter) => ({
+    chapterStates: job.cleanedChapters.map((chapter) => ({
       number: chapter.number,
-      title: chapter.title,
-      fallback: job.failedChapters.some((item) => item.number === chapter.number),
-    })).sort((a, b) => a.number - b.number),
+      title: job.results.get(chapter.number)?.title || chapter.title,
+      status: failedNumbers.has(chapter.number) ? (job.results.has(chapter.number) ? 'fallback' : 'failed') : job.results.has(chapter.number) ? 'done' : 'pending',
+    })),
+    reviewedChapters: job.cleanedChapters
+      .filter((chapter) => job.results.has(chapter.number))
+      .map((chapter) => ({
+        number: chapter.number,
+        title: job.results.get(chapter.number).title || chapter.title,
+        fallback: failedNumbers.has(chapter.number),
+      }))
+      .sort((a, b) => a.number - b.number),
     logs: job.logs.slice(-40),
     output: job.output ? {
       textName: path.basename(job.output.textPath),
@@ -536,11 +720,11 @@ function jobSnapshot(job) {
   };
 }
 
-async function processJob(job, document, selected, cleaned, batches) {
+async function processJob(job, document, batches) {
   job.status = 'running';
-  job.startedAt = new Date().toISOString();
-  addJobLog(job, `开始处理 ${cleaned.length} 章，共 ${batches.length} 批。`);
+  if (!job.startedAt) job.startedAt = new Date().toISOString();
   let nextBatchIndex = 0;
+  const pending = new Set(batches.flat().map((chapter) => chapter.number));
 
   const worker = async (workerIndex) => {
     while (true) {
@@ -555,6 +739,7 @@ async function processJob(job, document, selected, cleaned, batches) {
       addJobLog(job, `通道 ${workerIndex + 1} 正在处理${rangeLabel}。`);
 
       let results = [];
+      const failed = new Set();
       if (job.mode === 'rules') {
         results = batch;
         await sleep(30);
@@ -562,21 +747,36 @@ async function processJob(job, document, selected, cleaned, batches) {
         try {
           results = await runModelBatch(batch, job);
         } catch (batchError) {
-          addJobLog(job, `${rangeLabel}批量处理失败，自动降为逐章重试。`, 'warning');
+          if (job.controller.signal.aborted) return;
+          if (batchError instanceof SchedulerError && !batchError.retryable) {
+            job.fatalError = batchError;
+            job.controller.abort(batchError);
+            throw batchError;
+          }
+          const defer = batchError instanceof SchedulerError && (batchError.status === 429 || !batchError.retryable);
+          addJobLog(job, defer ? `${rangeLabel}请求受限或配置错误，暂缓重试。` : `${rangeLabel}批量处理失败，自动降为逐章重试。`, 'warning');
           for (const chapter of batch) {
             try {
+              await waitWhilePaused(job);
+              if (defer || batch.length === 1) throw batchError;
               const individual = await runModelBatch([chapter], job);
               results.push(individual[0]);
             } catch (chapterError) {
+              if (job.controller.signal.aborted) return;
+              failed.add(chapter.number);
+              job.failedChapters = job.failedChapters.filter((item) => item.number !== chapter.number);
               job.failedChapters.push({ number: chapter.number, error: chapterError.message });
-              results.push(chapter);
-              addJobLog(job, `第 ${chapter.number} 章模型校对失败，已保留规则清理版。`, 'error');
+              if (job.publicConfig.ruleFallback) results.push(chapter);
+              addJobLog(job, `第 ${chapter.number} 章模型校对失败，${job.publicConfig.ruleFallback ? '已保留规则清理版' : '等待重试'}。`, 'error');
             }
           }
         }
       }
 
-      for (const result of results) job.results.set(result.number, result);
+      for (const result of results) {
+        job.results.set(result.number, result);
+        if (!failed.has(result.number)) job.failedChapters = job.failedChapters.filter((item) => item.number !== result.number);
+      }
       if (job.publicConfig.glossaryAutoGrow) {
         const discovered = results.flatMap((result) => (result.glossaryAdd || [])
           .map((entry) => ({ ...entry, originChapter: result.number })));
@@ -593,10 +793,15 @@ async function processJob(job, document, selected, cleaned, batches) {
           if (merged.added) addJobLog(job, `词表自升级：新增 ${merged.added} 个词条。`, 'warning');
         }
       }
-      job.completedChapters += batch.length;
+      for (const chapter of batch) {
+        job.retryPending.delete(chapter.number);
+        pending.delete(chapter.number);
+      }
+      job.completedChapters = job.cleanedChapters.filter((chapter) => job.results.has(chapter.number)).length;
       job.completedBatches += 1;
       job.activeBatches.delete(workerIndex);
       addJobLog(job, `${rangeLabel}处理完成。`);
+      persistJob(job);
     }
   };
 
@@ -604,52 +809,50 @@ async function processJob(job, document, selected, cleaned, batches) {
     const workers = Array.from({ length: Math.min(job.publicConfig.concurrency, Math.max(1, batches.length)) }, (_, index) => worker(index));
     await Promise.all(workers);
     if (job.controller.signal.aborted) {
-      job.status = 'canceled';
+      job.status = 'interrupted';
       job.completedAt = new Date().toISOString();
-      addJobLog(job, '任务已取消。', 'warning');
+      addJobLog(job, '任务已中断，进度已保存，可在下次启动后继续。', 'warning');
+      persistJob(job);
       return;
     }
 
-    const ordered = cleaned.map((chapter) => job.results.get(chapter.number) || chapter);
-    const title = parseTitle(document.fileName, document.preamble);
-    const author = parseAuthor(document.preamble);
-    const stem = safeFilePart(path.basename(document.fileName, path.extname(document.fileName)));
-    const stamp = timestampForFile();
-    const textPath = path.join(EXPORT_DIR, `${stem}_第${ordered[0]?.number || ''}-${ordered[ordered.length - 1]?.number || ''}章_校对版_${stamp}.txt`);
-    const reportPath = path.join(EXPORT_DIR, `${stem}_校对报告_${stamp}.json`);
-    fs.writeFileSync(textPath, renderNovel(ordered, { title, author }), 'utf8');
-    fs.writeFileSync(reportPath, JSON.stringify({
-      sourceFile: document.fileName,
-      generatedAt: new Date().toISOString(),
-      mode: job.mode,
-      range: { start: ordered[0]?.number || null, end: ordered[ordered.length - 1]?.number || null, chapters: ordered.length },
-      config: job.publicConfig,
-      sourceParseStats: document.stats,
-      sourceWarnings: document.warnings,
-      cleanupStats: aggregateStats(cleaned),
-      failedChapters: job.failedChapters,
-      glossary: {
-        enabled: Boolean(job.publicConfig.useGlossary),
-        entryCount: normalizeGlossary(job.publicConfig.glossary).entries.length,
-        autoGrowEnabled: Boolean(job.publicConfig.glossaryAutoGrow),
-        autoAddedCount: job.autoAddedGlossary.length,
-        autoAdded: job.autoAddedGlossary,
-        finalGlossary: normalizeGlossary(job.publicConfig.glossary).entries,
-      },
-      note: '源文件未被覆盖；模型失败的章节自动保留规则清理版，并在 failedChapters 中列出。',
-    }, null, 2), 'utf8');
-    saveGlossary(document.id, normalizeGlossary(job.publicConfig.glossary));
-    if (job.failedChapters.length) {
-      addJobLog(job, `有 ${job.failedChapters.length} 章模型校对失败，已保留规则清理版；请检查模型、密钥或并发设置。`, 'warning');
+    if (job.failedChapters.length && job.publicConfig.autoRetryRounds > 0) {
+      const before = job.failedChapters.length;
+      addJobLog(job, `第一轮结束：${before} 章失败，自动进入失败章节重试轮。`, 'warning');
+      await runRetryPass(job);
+      if (job.controller.signal.aborted) {
+        job.status = 'interrupted';
+        job.completedAt = new Date().toISOString();
+        persistJob(job);
+        return;
+      }
+      const recovered = before - job.failedChapters.length;
+      addJobLog(job, recovered > 0 ? `失败章节重试轮恢复 ${recovered} 章。` : '失败章节重试轮没有恢复任何章节。', recovered > 0 ? 'info' : 'warning');
     }
-    job.output = { textPath, reportPath };
-    job.status = 'completed';
-    job.completedAt = new Date().toISOString();
-    addJobLog(job, `全部完成，已自动合并导出 ${path.basename(textPath)}。`);
+
+    // 仍失败的章节进入三级自动补偿队列（5 分钟 / 30 分钟 / 2 小时），不阻塞导出。
+    if (job.failedChapters.length) enqueueCompensation(job);
+
+    const remaining = job.cleanedChapters.filter((chapter) => !job.results.has(chapter.number));
+    if (remaining.length || (job.failedChapters.length && !job.publicConfig.ruleFallback)) {
+      job.status = 'failed';
+      job.error = job.publicConfig.ruleFallback
+        ? `有 ${remaining.length} 章仍未处理，请重试失败章节。`
+        : `有 ${job.failedChapters.length} 章校对失败，未启用规则回退；请重试失败章节。`;
+      job.completedAt = new Date().toISOString();
+      addJobLog(job, job.error, 'error');
+      persistJob(job);
+      return;
+    }
+    finalizeJob(job, document);
   } catch (error) {
     job.activeBatches.clear();
-    if (job.controller.signal.aborted) {
-      job.status = 'canceled';
+    if (job.fatalError) {
+      job.status = 'failed';
+      job.error = job.fatalError.message;
+      addJobLog(job, `配置错误，已停止任务：${job.error}`, 'error');
+    } else if (job.controller.signal.aborted) {
+      job.status = 'interrupted';
       job.error = null;
     } else {
       job.status = 'failed';
@@ -657,15 +860,65 @@ async function processJob(job, document, selected, cleaned, batches) {
       addJobLog(job, `任务失败：${error.message}`, 'error');
     }
     job.completedAt = new Date().toISOString();
+    persistJob(job);
   }
 }
 
-async function createJob(body) {
-  const document = documents.get(body.documentId);
-  if (!document) throw Object.assign(new Error('导入的小说已失效，请重新选择 TXT 文件。'), { statusCode: 404 });
-  const start = Number(body.start);
-  const end = Number(body.end);
-  const selected = selectChapters(document.chapters, start, end);
+function buildJobReport(job, document, ordered) {
+  return {
+    sourceFile: document.fileName,
+    generatedAt: new Date().toISOString(),
+    mode: job.mode,
+    range: { start: ordered[0]?.number || null, end: ordered[ordered.length - 1]?.number || null, chapters: ordered.length },
+    config: job.publicConfig,
+    sourceParseStats: document.stats,
+    sourceWarnings: document.warnings,
+    cleanupStats: aggregateStats(job.cleanedChapters),
+    failedChapters: job.failedChapters,
+    glossary: {
+      enabled: Boolean(job.publicConfig.useGlossary),
+      entryCount: normalizeGlossary(job.publicConfig.glossary).entries.length,
+      autoGrowEnabled: Boolean(job.publicConfig.glossaryAutoGrow),
+      autoAddedCount: job.autoAddedGlossary.length,
+      autoAdded: job.autoAddedGlossary,
+      finalGlossary: normalizeGlossary(job.publicConfig.glossary).entries,
+    },
+    note: '源文件未被覆盖；模型失败的章节及其处理状态在 failedChapters 中列出。',
+  };
+}
+
+// 导出并标记完成；补偿校对成功后也会调用它来收尾。
+function finalizeJob(job, document) {
+  const ordered = job.cleanedChapters.map((chapter) => job.results.get(chapter.number));
+  if (ordered.some((item) => !item)) return false;
+  const title = parseTitle(document.fileName, document.preamble);
+  const author = parseAuthor(document.preamble);
+  const stem = safeFilePart(path.basename(document.fileName, path.extname(document.fileName)));
+  const stamp = timestampForFile();
+  const textPath = job.output?.textPath || path.join(EXPORT_DIR, `${stem}_第${ordered[0]?.number || ''}-${ordered[ordered.length - 1]?.number || ''}章_校对版_${stamp}.txt`);
+  const reportPath = job.output?.reportPath || path.join(EXPORT_DIR, `${stem}_校对报告_${stamp}.json`);
+  fs.writeFileSync(textPath, renderNovel(ordered, { title, author }), 'utf8');
+  fs.writeFileSync(reportPath, JSON.stringify(buildJobReport(job, document, ordered), null, 2), 'utf8');
+  saveGlossary(document.id, normalizeGlossary(job.publicConfig.glossary));
+  if (job.failedChapters.length) {
+    addJobLog(job, `有 ${job.failedChapters.length} 章模型校对失败，已保留规则清理版；可点击“重试失败章节”或检查模型、密钥与并发设置。`, 'warning');
+  }
+  job.output = { textPath, reportPath };
+  job.resumable = false;
+  job.status = 'completed';
+  job.completedAt = new Date().toISOString();
+  addJobLog(job, `全部完成，已自动合并导出 ${path.basename(textPath)}。`);
+  persistJob(job);
+  return true;
+}
+
+function synchronizeJobConfig(job) {
+  job.secretConfig = { ...job.publicConfig, apiKey: job.apiKey || '' };
+  return job;
+}
+
+async function buildJobFromBody(body, document) {
+  const selected = selectChapters(document.chapters, Number(body.start), Number(body.end));
   if (!selected.length) throw Object.assign(new Error('所选范围内没有识别到章节。'), { statusCode: 400 });
   const cleaned = selected.map((chapter) => cleanChapter(chapter));
   const chaptersPerBatch = clamp(body.chaptersPerBatch, 1, 10, 3);
@@ -675,11 +928,8 @@ async function createJob(body) {
   const baseUrl = normalizeBaseUrl(body.provider?.baseUrl || 'http://127.0.0.1:3001/v1');
   const model = String(body.provider?.model || 'auto').trim() || 'auto';
   if (mode === 'llm' && !baseUrl) throw Object.assign(new Error('请填写模型 Base URL。'), { statusCode: 400 });
-  const batches = createBatches(cleaned, chaptersPerBatch, maxCharsPerBatch);
-  const id = crypto.randomUUID();
-  const controller = new AbortController();
-  const job = {
-    id,
+  return {
+    id: crypto.randomUUID(),
     documentId: document.id,
     fileName: document.fileName,
     status: 'queued',
@@ -690,17 +940,20 @@ async function createJob(body) {
     completedAt: null,
     totalChapters: cleaned.length,
     completedChapters: 0,
-    totalBatches: batches.length,
+    totalBatches: 0,
     completedBatches: 0,
     failedChapters: [],
     results: new Map(),
+    cleanedChapters: cleaned,
+    retryPending: new Set(),
     activeBatches: new Map(),
     logs: [],
     output: null,
     error: null,
     autoAddedGlossary: [],
     parseStats: document.stats,
-    controller,
+    controller: new AbortController(),
+    resumable: false,
     publicConfig: {
       start: selected[0].number,
       end: selected[selected.length - 1].number,
@@ -713,16 +966,223 @@ async function createJob(body) {
       timeoutMs: clamp(body.provider?.timeoutMs, 15000, 300000, 120000),
       maxTokens: clamp(body.provider?.maxTokens, 1000, 64000, 20000),
       rules: String(body.rules || DEFAULT_RULES),
+      ruleFallback: body.ruleFallback !== false,
+      autoRetryRounds: clamp(body.autoRetryRounds, 0, 3, 1),
       useGlossary: body.useGlossary !== false,
       glossaryAutoGrow: Boolean(body.glossaryAutoGrow),
       glossary: normalizeGlossary(body.glossary),
     },
+    apiKey: String(body.provider?.apiKey || ''),
   };
-  job.secretConfig = { ...job.publicConfig, apiKey: String(body.provider?.apiKey || '') };
-  jobs.set(id, job);
-  processJob(job, document, selected, cleaned, batches);
+}
+
+async function createJob(body) {
+  const document = documents.get(body.documentId);
+  if (!document) throw Object.assign(new Error('导入的小说已失效，请重新选择 TXT 文件。'), { statusCode: 404 });
+  const job = await buildJobFromBody(body, document);
+  jobs.set(job.id, job);
+  persistJob(job);
+  resumeJob(job, document, { restart: false });
   return job;
 }
+
+function pendingChapters(job) {
+  const failedNumbers = new Set(job.failedChapters.map((item) => item.number));
+  const pending = job.cleanedChapters.filter((chapter) => !job.results.has(chapter.number) && !failedNumbers.has(chapter.number));
+  const retry = job.cleanedChapters.filter((chapter) => failedNumbers.has(chapter.number));
+  return pending.concat(retry);
+}
+
+function resumeJob(job, document, options = {}) {
+  const restart = Boolean(options.restart);
+  const pending = restart && job.status === 'completed' ? job.cleanedChapters : pendingChapters(job);
+  if (!pending.length) {
+    if (job.status !== 'completed') {
+      job.status = 'completed';
+      addJobLog(job, '所有章节都已处理完成。');
+    }
+    return job;
+  }
+  const batches = createBatches(pending, job.publicConfig.chaptersPerBatch, job.publicConfig.maxCharsPerBatch);
+  job.totalBatches = batches.length;
+  job.completedBatches = 0;
+  job.completedAt = null;
+  job.error = null;
+  job.resumable = false;
+  if (!job.startedAt) job.startedAt = new Date().toISOString();
+  synchronizeJobConfig(job);
+  addJobLog(job, restart
+    ? `重新开始处理 ${pending.length} 章，共 ${batches.length} 批。`
+    : `继续处理剩余 ${pending.length} 章，共 ${batches.length} 批；已完成 ${job.results.size} 章。`);
+  processJob(job, document, batches);
+  return job;
+}
+
+async function runRetryPass(job) {
+  const failedNumbers = new Set(job.failedChapters.filter((item) => !/HTTP 429\b/.test(item.error)).map((item) => item.number));
+  const retry = job.cleanedChapters.filter((chapter) => failedNumbers.has(chapter.number));
+  if (!retry.length) return;
+  const batches = createBatches(retry, 1, job.publicConfig.maxCharsPerBatch);
+  addJobLog(job, `失败章节重试：${retry.length} 章，共 ${batches.length} 批。`, 'warning');
+  for (const batch of batches) {
+    await waitWhilePaused(job);
+    if (job.controller.signal.aborted) return;
+    try {
+      const results = await runModelBatch(batch, job);
+      for (const result of results) {
+        job.results.set(result.number, result);
+        job.failedChapters = job.failedChapters.filter((item) => item.number !== result.number);
+        addJobLog(job, `第 ${result.number} 章重试成功。`, 'info');
+        persistJob(job);
+      }
+    } catch (error) {
+      addJobLog(job, `第 ${batch[0].number} 章重试仍然失败：${error.message}`, 'error');
+    }
+  }
+}
+
+// ---------- 三级自动补偿队列 ----------
+// 主流程 + 逐章重试轮都失败的章节进入这里：5 分钟第 1 次、30 分钟第 2 次、2 小时第 3 次。
+// 补偿成功则替换规则回退版并更新导出；仍失败则保留并标记。不阻塞任何正常章节。
+const COMPENSATION_DELAYS_MS = (process.env.COMPENSATION_DELAYS_MS || '')
+  .split(',')
+  .map((value) => Number(value.trim()))
+  .filter((value) => Number.isFinite(value) && value > 0);
+if (!COMPENSATION_DELAYS_MS.length) COMPENSATION_DELAYS_MS.push(5 * 60 * 1000, 30 * 60 * 1000, 2 * 60 * 60 * 1000);
+const COMPENSATION_TICK_MS = Number(process.env.COMPENSATION_TICK_MS) > 0 ? Number(process.env.COMPENSATION_TICK_MS) : 20000;
+const compensationQueue = [];
+const exportRefreshTimers = new Map();
+
+function compensationKey(jobId, number) {
+  return `${jobId}:${number}`;
+}
+
+function enqueueCompensation(job) {
+  const existing = new Set(compensationQueue.map((item) => compensationKey(item.jobId, item.number)));
+  let added = 0;
+  for (const failed of job.failedChapters) {
+    if (existing.has(compensationKey(job.id, failed.number))) continue;
+    compensationQueue.push({
+      jobId: job.id,
+      number: failed.number,
+      attempt: 0,
+      dueAt: Date.now() + COMPENSATION_DELAYS_MS[0],
+      lastError: failed.error || null,
+    });
+    added += 1;
+  }
+  if (added) {
+    addJobLog(job, `${added} 个失败章节进入自动补偿队列：5 分钟 / 30 分钟 / 2 小时后各重试一次。`, 'warning');
+    persistJob(job);
+  }
+}
+
+function compensationSnapshotFor(jobId) {
+  return compensationQueue
+    .filter((item) => item.jobId === jobId)
+    .map((item) => ({ number: item.number, attempt: item.attempt, dueAt: new Date(item.dueAt).toISOString(), lastError: item.lastError }))
+    .sort((a, b) => a.number - b.number);
+}
+
+// 补偿成功后防抖刷新导出：60 秒内多次成功只重写一次，队列清空时立即刷新。
+function scheduleExportRefresh(job) {
+  job.exportDirty = true;
+  if (exportRefreshTimers.has(job.id)) return;
+  const timer = setTimeout(() => {
+    exportRefreshTimers.delete(job.id);
+    flushExportRefresh(job);
+  }, 60000);
+  timer.unref();
+  exportRefreshTimers.set(job.id, timer);
+}
+
+function flushExportRefresh(job) {
+  if (!job.exportDirty) return;
+  job.exportDirty = false;
+  const document = documents.get(job.documentId);
+  if (!document || !job.output) return;
+  const ordered = job.cleanedChapters.map((candidate) => job.results.get(candidate.number));
+  if (ordered.some((entry) => !entry)) return;
+  try {
+    const title = parseTitle(document.fileName, document.preamble);
+    const author = parseAuthor(document.preamble);
+    fs.writeFileSync(job.output.textPath, renderNovel(ordered, { title, author }), 'utf8');
+    fs.writeFileSync(job.output.reportPath, JSON.stringify(buildJobReport(job, document, ordered), null, 2), 'utf8');
+    addJobLog(job, '导出文件已更新（包含补偿校对结果）。', 'info');
+  } catch (error) {
+    job.exportDirty = true;
+    addJobLog(job, `导出刷新失败：${error.message}`, 'warning');
+  }
+}
+
+async function runCompensationItem(item) {
+  const job = jobs.get(item.jobId);
+  if (!job) return 'dropped';
+  const stillFailed = job.failedChapters.some((failed) => failed.number === item.number);
+  if (!stillFailed) return 'dropped';
+  const chapter = job.cleanedChapters.find((candidate) => candidate.number === item.number);
+  if (!chapter) return 'dropped';
+  try {
+    const results = await runModelBatch([chapter], job);
+    const result = results[0];
+    job.results.set(item.number, result);
+    job.failedChapters = job.failedChapters.filter((failed) => failed.number !== item.number);
+    job.completedChapters = job.cleanedChapters.filter((candidate) => job.results.has(candidate.number)).length;
+    addJobLog(job, `第 ${item.number} 章补偿校对成功，已替换规则回退版。`, 'info');
+    persistJob(job);
+    if (!job.failedChapters.length) {
+      const document = documents.get(job.documentId);
+      if (document) {
+        if (job.output) {
+          // 已导出过的任务：防抖刷新导出文件，避免逐章重写大文件。
+          scheduleExportRefresh(job);
+        } else {
+          finalizeJob(job, document);
+        }
+      }
+    } else if (job.output) {
+      scheduleExportRefresh(job);
+    }
+    return 'recovered';
+  } catch (error) {
+    item.lastError = error.message;
+    item.attempt += 1;
+    addJobLog(job, `第 ${item.number} 章第 ${item.attempt} 次补偿失败：${error.message}`, 'warning');
+    if (item.attempt < COMPENSATION_DELAYS_MS.length) {
+      item.dueAt = Date.now() + COMPENSATION_DELAYS_MS[item.attempt];
+      return 'retry-later';
+    }
+    addJobLog(job, `第 ${item.number} 章三次补偿均失败，保留规则清理版，可手动重试。`, 'error');
+    return 'gave-up';
+  }
+}
+
+const compensationTimer = setInterval(() => {
+  const now = Date.now();
+  // ponytail: 同时补偿最多 3 章；如补偿吞吐成为瓶颈，可改为独立可配置配额。
+  let slots = Math.max(0, 3 - compensationQueue.filter((item) => item.running).length);
+  for (const item of compensationQueue) {
+    const job = jobs.get(item.jobId);
+    if (!slots || item.running || item.dueAt > now || !job || job.restored || ['running', 'paused', 'interrupted'].includes(job.status)) continue;
+    slots -= 1;
+    item.running = true;
+    runCompensationItem(item).then((outcome) => {
+      item.running = false;
+      if (outcome !== 'retry-later') {
+        const index = compensationQueue.indexOf(item);
+        if (index >= 0) compensationQueue.splice(index, 1);
+      }
+      if (!compensationQueue.some((entry) => entry.jobId === item.jobId) && job.exportDirty) flushExportRefresh(job);
+      persistJob(job);
+    }).catch((error) => {
+      item.running = false;
+      item.dueAt = Date.now() + COMPENSATION_DELAYS_MS[0];
+      item.lastError = error.message;
+      persistJob(job);
+    });
+  }
+}, COMPENSATION_TICK_MS);
+compensationTimer.unref();
 
 async function handleApi(request, response, url) {
   const pathname = url.pathname;
@@ -736,7 +1196,13 @@ async function handleApi(request, response, url) {
       glossaryOptions: { useGlossary: true, glossaryAutoGrow: false, extractionCharLimit: 120000, useWebSearch: false },
       providerPresets: PROVIDER_PRESETS,
       launcherPath: DEFAULT_LAUNCHER,
+      scheduler: scheduler.snapshot(),
     });
+    return;
+  }
+
+  if (request.method === 'GET' && pathname === '/api/scheduler') {
+    sendJson(response, 200, scheduler.snapshot());
     return;
   }
 
@@ -855,14 +1321,66 @@ async function handleApi(request, response, url) {
     return;
   }
 
+  if (request.method === 'GET' && pathname === '/api/jobs') {
+    const list = Array.from(jobs.values())
+      .filter((job) => job.status !== 'completed' || job.failedChapters.length)
+      .map((job) => ({
+        id: job.id,
+        documentId: job.documentId,
+        fileName: job.fileName,
+        status: job.status,
+        mode: job.mode,
+        updatedAt: job.updatedAt,
+        totalChapters: job.totalChapters,
+        completedChapters: job.completedChapters,
+        failedCount: job.failedChapters.length,
+        range: [job.publicConfig.start, job.publicConfig.end],
+        baseUrl: job.publicConfig.baseUrl,
+        model: job.publicConfig.model,
+        output: job.output ? {
+          textName: path.basename(job.output.textPath),
+          textUrl: `/api/jobs/${job.id}/download?type=text`,
+          reportUrl: `/api/jobs/${job.id}/download?type=report`,
+        } : null,
+      }))
+      .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    sendJson(response, 200, { jobs: list });
+    return;
+  }
+
+  if (request.method === 'GET' && pathname === '/api/jobs/resumable') {
+    const list = Array.from(jobs.values())
+      .filter((job) => job.resumable || ['interrupted', 'paused'].includes(job.status))
+      .map((job) => ({
+        id: job.id,
+        documentId: job.documentId,
+        fileName: job.fileName,
+        status: job.status,
+        mode: job.mode,
+        updatedAt: job.updatedAt,
+        totalChapters: job.totalChapters,
+        completedChapters: job.completedChapters,
+        failedCount: job.failedChapters.length,
+        range: [job.publicConfig.start, job.publicConfig.end],
+        baseUrl: job.publicConfig.baseUrl,
+        model: job.publicConfig.model,
+      }))
+      .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    sendJson(response, 200, { jobs: list });
+    return;
+  }
+
   if (request.method === 'POST' && pathname === '/api/jobs') {
     const body = await readJson(request);
     const job = await createJob(body);
+    if (process.env.DEBUG_JOBS) {
+      try { jobSnapshot(job); } catch (error) { console.error('snapshot debug:', error.stack); }
+    }
     sendJson(response, 202, jobSnapshot(job));
     return;
   }
 
-  const jobMatch = pathname.match(/^\/api\/jobs\/([^/]+)(?:\/(pause|resume|cancel|download|chapter))?$/);
+  const jobMatch = pathname.match(/^\/api\/jobs\/([^/]+)(?:\/(pause|resume|cancel|discard|download|chapter|retry))?$/);
   if (jobMatch) {
     const job = jobs.get(jobMatch[1]);
     if (!job) throw Object.assign(new Error('任务不存在。'), { statusCode: 404 });
@@ -871,37 +1389,109 @@ async function handleApi(request, response, url) {
       sendJson(response, 200, jobSnapshot(job));
       return;
     }
-    if (request.method === 'GET' && action === 'chapter') {
-      const number = Number(url.searchParams.get('number'));
-      const original = documents.get(job.documentId)?.chapters.find((chapter) => chapter.number === number);
-      const result = job.results.get(number);
-      if (!original || !result) throw Object.assign(new Error('该章节尚未完成或不存在。'), { statusCode: 404 });
-      sendJson(response, 200, {
-        number, before: { title: original.title, body: original.rawBody },
-        after: { title: result.title, body: result.body },
-        fallback: job.failedChapters.some((item) => item.number === number),
-      });
+    if (request.method === 'POST' && action === 'retry') {
+      if (job.status === 'running') throw Object.assign(new Error('任务正在运行，请先暂停或等待结束。'), { statusCode: 409 });
+      if (!job.failedChapters.length) throw Object.assign(new Error('当前没有需要重试的失败章节。'), { statusCode: 409 });
+      const document = documents.get(job.documentId);
+      if (!document) throw Object.assign(new Error('原稿已失效，请重新导入该小说。'), { statusCode: 404 });
+      const body = await readJson(request);
+      const provider = body.provider || {};
+      if (provider.baseUrl !== undefined) job.publicConfig.baseUrl = normalizeBaseUrl(provider.baseUrl);
+      if (provider.model !== undefined) job.publicConfig.model = String(provider.model).trim();
+      if (provider.apiKey !== undefined) job.apiKey = String(provider.apiKey);
+      if (provider.timeoutMs !== undefined) job.publicConfig.timeoutMs = clamp(provider.timeoutMs, 15000, 300000, 120000);
+      if (provider.maxTokens !== undefined) job.publicConfig.maxTokens = clamp(provider.maxTokens, 1000, 64000, 20000);
+      if (body.rules !== undefined) job.publicConfig.rules = String(body.rules || DEFAULT_RULES);
+      if (job.mode === 'llm' && (!job.publicConfig.baseUrl || !job.publicConfig.model)) {
+        throw Object.assign(new Error('请填写模型 Base URL 和模型名称。'), { statusCode: 400 });
+      }
+      job.controller = new AbortController();
+      const failedNumbers = new Set(job.failedChapters.map((item) => item.number));
+      const retry = job.cleanedChapters.filter((chapter) => failedNumbers.has(chapter.number));
+      const batches = createBatches(retry, 1, job.publicConfig.maxCharsPerBatch);
+      job.totalBatches = batches.length;
+      job.completedBatches = 0;
+      job.completedAt = null;
+      job.error = null;
+      job.resumable = false;
+      synchronizeJobConfig(job);
+      addJobLog(job, `手动重试 ${retry.length} 个失败章节，共 ${batches.length} 批。`, 'warning');
+      processJob(job, document, batches);
+      sendJson(response, 202, jobSnapshot(job));
       return;
     }
     if (request.method === 'POST' && action === 'pause') {
       if (job.status === 'running') {
         job.status = 'paused';
-        addJobLog(job, '任务已暂停，新批次暂不启动。', 'warning');
+        addJobLog(job, '任务已暂停，新批次暂不启动；进度已保存。', 'warning');
+        persistJob(job);
       }
       sendJson(response, 200, jobSnapshot(job));
       return;
     }
     if (request.method === 'POST' && action === 'resume') {
-      if (job.status === 'paused') {
-        job.status = 'running';
-        addJobLog(job, '任务已继续。');
+      const body = await readJson(request);
+      const targetDocument = documents.get(body.documentId || job.documentId);
+      if (!targetDocument) throw Object.assign(new Error('请重新导入该小说原稿，再继续未完成任务。'), { statusCode: 404 });
+      if (body.provider) {
+        if (body.provider.baseUrl !== undefined) job.publicConfig.baseUrl = normalizeBaseUrl(body.provider.baseUrl);
+        if (body.provider.model !== undefined) job.publicConfig.model = String(body.provider.model).trim();
+        if (body.provider.apiKey !== undefined) job.apiKey = String(body.provider.apiKey);
+        if (body.provider.timeoutMs !== undefined) job.publicConfig.timeoutMs = clamp(body.provider.timeoutMs, 15000, 300000, 120000);
+        if (body.provider.maxTokens !== undefined) job.publicConfig.maxTokens = clamp(body.provider.maxTokens, 1000, 64000, 20000);
       }
-      sendJson(response, 200, jobSnapshot(job));
+      if (body.rules !== undefined) job.publicConfig.rules = String(body.rules || DEFAULT_RULES);
+      if (body.concurrency !== undefined) job.publicConfig.concurrency = clamp(body.concurrency, 1, 10, job.publicConfig.concurrency);
+      if (body.chaptersPerBatch !== undefined) job.publicConfig.chaptersPerBatch = clamp(body.chaptersPerBatch, 1, 10, job.publicConfig.chaptersPerBatch);
+      if (job.mode === 'llm' && !job.publicConfig.baseUrl) throw Object.assign(new Error('请填写模型 Base URL。'), { statusCode: 400 });
+      if (job.status === 'running') throw Object.assign(new Error('任务正在运行。'), { statusCode: 409 });
+      if (job.status === 'paused' && !job.restored) {
+        synchronizeJobConfig(job);
+        job.status = 'running';
+        addJobLog(job, '已继续暂停的任务。');
+        persistJob(job);
+      } else {
+        job.controller = new AbortController();
+        job.fatalError = null;
+        job.documentId = targetDocument.id;
+        job.restored = false;
+        synchronizeJobConfig(job);
+        if (job.status === 'completed' && compensationQueue.some((item) => item.jobId === job.id) && !body.restart) {
+          addJobLog(job, '已恢复自动补偿队列。');
+          persistJob(job);
+        } else {
+          for (let i = compensationQueue.length - 1; i >= 0; i--) if (compensationQueue[i].jobId === job.id) compensationQueue.splice(i, 1);
+          resumeJob(job, targetDocument, { restart: Boolean(body.restart) });
+        }
+      }
+      sendJson(response, 202, jobSnapshot(job));
+      return;
+    }
+    if (request.method === 'POST' && action === 'discard') {
+      if (job.status === 'running') job.controller.abort(new Error('用户放弃任务'));
+      job.status = 'discarded';
+      job.resumable = false;
+      jobs.delete(job.id);
+      deletePersistedJob(job.id);
+      sendJson(response, 200, { ok: true, id: job.id });
       return;
     }
     if (request.method === 'POST' && action === 'cancel') {
       if (!['completed', 'failed', 'canceled'].includes(job.status)) job.controller.abort(new Error('用户取消任务'));
       sendJson(response, 200, jobSnapshot(job));
+      return;
+    }
+    if (request.method === 'GET' && action === 'chapter') {
+      const number = Number(url.searchParams.get('number'));
+      const chapter = job.cleanedChapters.find((item) => item.number === number);
+      const result = job.results.get(number);
+      if (!chapter || !result) throw Object.assign(new Error('该章节尚未完成或不存在。'), { statusCode: 404 });
+      sendJson(response, 200, {
+        number,
+        before: { title: chapter.title, body: chapter.rawBody },
+        after: { title: result.title, body: result.body },
+        fallback: job.failedChapters.some((item) => item.number === number),
+      });
       return;
     }
     if (request.method === 'GET' && action === 'download') {
@@ -934,7 +1524,33 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
+const restoredJobs = loadPersistedJobs();
+
 server.listen(PORT, HOST, () => {
-  console.log(`电子书校对已启动：http://${HOST}:${PORT}`);
+  console.log(`电子说校对工作台已启动：http://${HOST}:${PORT}`);
   console.log(`自动导出目录：${EXPORT_DIR}`);
+  if (restoredJobs.length) console.log(`已载入 ${restoredJobs.length} 个未完成任务，可在页面顶部继续。`);
 });
+
+// 优雅关闭：中止在途请求并保存所有未完成任务的进度，重启后可继续。
+function gracefulShutdown(reason) {
+  for (const job of jobs.values()) {
+    if (!['running', 'paused', 'queued'].includes(job.status)) continue;
+    job.controller.abort(new Error(`工作台收到 ${reason}，进度保存中`));
+  }
+  setTimeout(() => {
+    for (const job of jobs.values()) {
+      if (['running', 'paused', 'queued', 'interrupted'].includes(job.status)) {
+        job.status = 'interrupted';
+        job.completedAt = new Date().toISOString();
+        addJobLog(job, `工作台关闭（${reason}），进度已保存，下次启动后可继续。`, 'warning');
+        persistJob(job);
+      }
+    }
+    process.exit(0);
+  }, 1500);
+}
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => gracefulShutdown(signal));
+}

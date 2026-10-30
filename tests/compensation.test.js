@@ -62,7 +62,7 @@ test('失败章节进入三级补偿队列，补偿成功后替换规则回退�
   const modelUrl = `http://127.0.0.1:${model.address().port}`;
   const text = [1, 2].map((n) => `第${n}章 标题${n}\n${`原文${n}。`.repeat(60)}`).join('\n');
 
-  const bench = await startWorkbench(root);
+  let bench = await startWorkbench(root);
   try {
     const document = await (await fetch(`${bench.base}/api/documents/analyze`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ fileName: '补偿测试.txt', text }),
@@ -87,8 +87,19 @@ test('失败章节进入三级补偿队列，补偿成功后替换规则回退�
     assert.equal(job.compensation.pending, 1, '失败章节应进入补偿队列');
     assert.equal(job.compensation.items[0].number, 2);
 
-    // 主流程已结束：放行模型，等待补偿 tick（800ms 后第 1 次补偿）
+    // 重启后队列、补偿时间和源章节应仍在，不必重新导入原稿。
+    bench.child.kill();
+    await new Promise((resolve) => bench.child.once('exit', resolve));
+    bench = await startWorkbench(root);
+    job = await (await fetch(`${bench.base}/api/jobs/${created.id}`)).json();
+    assert.equal(job.compensation.pending, 1);
+    assert.equal(job.compensation.items[0].number, 2);
     failChapter2 = false;
+    const resumed = await fetch(`${bench.base}/api/jobs/${created.id}/resume`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: { baseUrl: modelUrl, model: 'mock' } }),
+    });
+    assert.equal(resumed.status, 202);
+    // 队列按保存的时间继续，成功后刷新已生成的导出。
     for (let i = 0; i < 100; i += 1) {
       job = await (await fetch(`${bench.base}/api/jobs/${created.id}`)).json();
       if (job.failedCount === 0) break;

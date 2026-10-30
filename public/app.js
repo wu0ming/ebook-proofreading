@@ -6,7 +6,12 @@ const state = {
   sourceFile: null,
   job: null,
   pollTimer: null,
+  reviewPage: 0,
+  reviewFilter: 'all',
+  resumableJobs: [],
 };
+
+const REVIEW_PAGE_SIZE = 48;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -41,6 +46,9 @@ const elements = {
   modelName: $('#modelName'),
   apiKey: $('#apiKey'),
   launcherPath: $('#launcherPath'),
+  saveConnectionButton: $('#saveConnectionButton'),
+  clearConnectionButton: $('#clearConnectionButton'),
+  connectionSaveStatus: $('#connectionSaveStatus'),
   providerTestStatus: $('#providerTestStatus'),
   testProviderButton: $('#testProviderButton'),
   startFreeLlmButton: $('#startFreeLlmButton'),
@@ -48,6 +56,28 @@ const elements = {
   chaptersPerBatch: $('#chaptersPerBatch'),
   concurrency: $('#concurrency'),
   maxCharsPerBatch: $('#maxCharsPerBatch'),
+  ruleFallback: $('#ruleFallback'),
+  autoRetryRounds: $('#autoRetryRounds'),
+  retryArea: $('#retryArea'),
+  resumeCard: $('#resumeCard'),
+  resumeTitle: $('#resumeTitle'),
+  resumeDescription: $('#resumeDescription'),
+  resumeJobButton: $('#resumeJobButton'),
+  discardJobButton: $('#discardJobButton'),
+  reviewFilters: $('#reviewFilters'),
+  reviewPager: $('#reviewPager'),
+  progressLive: $('#progressLive'),
+  retrySummary: $('#retrySummary'),
+  retryFailedButton: $('#retryFailedButton'),
+  compensationArea: $('#compensationArea'),
+  compensationSummary: $('#compensationSummary'),
+  schedulerPanel: $('#schedulerPanel'),
+  schedulerState: $('#schedulerState'),
+  schedulerInFlight: $('#schedulerInFlight'),
+  schedulerLimit: $('#schedulerLimit'),
+  schedulerSuccessRate: $('#schedulerSuccessRate'),
+  schedulerTotal: $('#schedulerTotal'),
+  schedulerModels: $('#schedulerModels'),
   batchFigure: $('#batchFigure'),
   concurrencyFigure: $('#concurrencyFigure'),
   inFlightFigure: $('#inFlightFigure'),
@@ -172,11 +202,90 @@ async function initialize() {
   elements.chaptersPerBatch.value = state.defaults.batching.chaptersPerBatch;
   elements.concurrency.value = state.defaults.batching.concurrency;
   elements.maxCharsPerBatch.value = state.defaults.batching.maxCharsPerBatch;
+  if (elements.autoRetryRounds) elements.autoRetryRounds.value = 1;
   renderProviderPresets();
+  loadConnectionSettings();
   setGlossary(state.defaults.glossary);
   updateRuleCount();
   updateBatchVisual();
+  await loadResumableJobs();
+  // 服务重启后，只有已保存的匹配连接才用于自动续跑。
+  const jobs = await api('/api/jobs', { method: 'GET', headers: {} });
+  const active = (jobs.jobs || []).find((job) => ['running', 'paused'].includes(job.status));
+  if (active) {
+    state.job = await api(`/api/jobs/${encodeURIComponent(active.id)}`, { method: 'GET', headers: {} });
+    elements.progressCard.classList.remove('hidden');
+    renderJob(state.job);
+    schedulePoll(200);
+  } else {
+    const saved = (() => { try { return JSON.parse(localStorage.getItem(CONNECTION_SETTINGS_KEY) || 'null'); } catch { return null; } })();
+    const target = state.resumableJobs.find((job) => ['interrupted', 'completed'].includes(job.status) && (job.mode === 'rules' || (saved && saved.baseUrl === job.baseUrl && saved.model === job.model)));
+    if (target) await resumePersistedJob(target.id, true);
+  }
   await checkFreeLlm();
+  refreshScheduler();
+  setInterval(refreshScheduler, 3000);
+}
+
+async function refreshScheduler() {
+  try {
+    const snapshot = await api('/api/scheduler', { method: 'GET', headers: {} });
+    renderScheduler(snapshot);
+  } catch { /* 调度面板非关键，静默失败 */ }
+}
+
+function renderScheduler(snapshot) {
+  if (!snapshot) return;
+  const busy = snapshot.inFlight > 0;
+  elements.schedulerState.textContent = busy ? '运行中' : '空闲';
+  elements.schedulerState.classList.toggle('live', busy);
+  elements.schedulerInFlight.textContent = `${snapshot.inFlight} / ${snapshot.maxGlobal}`;
+  elements.schedulerLimit.textContent = `${snapshot.currentLimit}（上限 ${snapshot.maxConcurrency}）`;
+  elements.schedulerSuccessRate.textContent = snapshot.stats.successRate == null ? '—' : `${snapshot.stats.successRate}%`;
+  elements.schedulerTotal.textContent = formatNumber(snapshot.stats.total);
+  const models = Object.entries(snapshot.stats.byModel || {})
+    .sort((a, b) => (b[1].total || 0) - (a[1].total || 0))
+    .slice(0, 6);
+  if (!models.length) {
+    elements.schedulerModels.innerHTML = '<span class="scheduler-empty">暂无请求记录</span>';
+    return;
+  }
+  elements.schedulerModels.innerHTML = models.map(([model, item]) => {
+    const rate = item.total ? Math.round((item.succeeded / item.total) * 100) : 0;
+    const state = item.failed && item.succeeded === 0 ? 'bad' : item.failed ? 'warn' : 'good';
+    return `<div class="scheduler-model ${state}"><strong>${escapeHtml(model)}</strong><span>${formatNumber(item.succeeded)} / ${formatNumber(item.total)} · ${rate}%</span></div>`;
+  }).join('');
+}
+
+const CONNECTION_SETTINGS_KEY = 'ebook-proofreading.connection.v1';
+
+function loadConnectionSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(CONNECTION_SETTINGS_KEY) || 'null');
+    if (!saved || typeof saved !== 'object') return;
+    if (typeof saved.baseUrl === 'string') elements.baseUrl.value = saved.baseUrl;
+    if (typeof saved.model === 'string') elements.modelName.value = saved.model;
+    if (typeof saved.apiKey === 'string') elements.apiKey.value = saved.apiKey;
+    if (typeof saved.launcherPath === 'string') elements.launcherPath.value = saved.launcherPath;
+    $$('#providerPresets .preset').forEach((button) => button.classList.toggle('active', button.dataset.base === elements.baseUrl.value && button.dataset.model === elements.modelName.value));
+    elements.connectionSaveStatus.textContent = '已载入本机配置';
+  } catch { elements.connectionSaveStatus.textContent = '读取失败'; }
+}
+
+function saveConnectionSettings() {
+  try {
+    localStorage.setItem(CONNECTION_SETTINGS_KEY, JSON.stringify({ baseUrl: elements.baseUrl.value.trim(), model: elements.modelName.value.trim(), apiKey: elements.apiKey.value, launcherPath: elements.launcherPath.value.trim() }));
+    elements.connectionSaveStatus.textContent = '已保存到本机浏览器';
+    toast('模型配置已保存。', 'success');
+  } catch { toast('保存失败，请检查浏览器的本地存储设置。', 'error'); }
+}
+
+function clearConnectionSettings() {
+  try {
+    localStorage.removeItem(CONNECTION_SETTINGS_KEY);
+    elements.connectionSaveStatus.textContent = '已清除本机保存的配置';
+    toast('已清除保存的配置；当前输入保持不变。', 'success');
+  } catch { toast('清除失败，请检查浏览器的本地存储设置。', 'error'); }
 }
 
 function renderProviderPresets() {
@@ -555,6 +664,8 @@ async function startJob() {
         chaptersPerBatch: Number(elements.chaptersPerBatch.value),
         concurrency: Number(elements.concurrency.value),
         maxCharsPerBatch: Number(elements.maxCharsPerBatch.value),
+        ruleFallback: elements.ruleFallback.checked,
+        autoRetryRounds: Number(elements.autoRetryRounds.value || 1),
         rules: elements.rulesEditor.value,
         useGlossary: elements.useGlossary.checked,
         glossaryAutoGrow: elements.glossaryAutoGrow.checked,
@@ -596,21 +707,29 @@ function renderJob(job) {
   const statusLabels = {
     queued: '正在排队',
     running: '批量校对进行中',
-    paused: '任务已暂停',
+    paused: '任务已暂停，进度已保存',
+    interrupted: '任务中断，进度已保存',
     completed: '全部处理完成',
     failed: '任务失败',
     canceled: '任务已取消',
+    discarded: '任务已放弃',
   };
   elements.progressSubtitle.textContent = `${statusLabels[job.status] || job.status} · ${job.mode === 'rules' ? '仅规则整理' : `${job.config.model} @ ${job.config.baseUrl}`}`;
   elements.progressPercent.textContent = `${job.progress}%`;
   elements.progressRing.style.background = `conic-gradient(var(--accent) ${job.progress * 3.6}deg, #e8e5dc 0deg)`;
   elements.progressBar.style.width = `${job.progress}%`;
-  elements.progressChapterLabel.textContent = `${formatNumber(job.completedChapters)} / ${formatNumber(job.totalChapters)} 章`;
+  const succeeded = job.succeededChapters ?? job.completedChapters ?? 0;
+  elements.progressChapterLabel.textContent = `${formatNumber(succeeded)} / ${formatNumber(job.totalChapters)} 章`;
   elements.progressBatchLabel.textContent = `${formatNumber(job.completedBatches)} / ${formatNumber(job.totalBatches)} 批`;
-  const reviewHtml = (job.reviewedChapters || []).map((chapter) =>
-    `<button class="review-chapter" data-number="${chapter.number}"><strong>第 ${chapter.number} 章</strong><span>${escapeHtml(chapter.title || '未命名')}</span>${chapter.fallback ? '<em>规则回退</em>' : ''}</button>`
-  ).join('') || '<span>完成章节后显示在这里。</span>';
-  if (elements.reviewList.innerHTML !== reviewHtml) elements.reviewList.innerHTML = reviewHtml;
+  if (elements.progressLive) {
+    const liveText = job.currentChapter
+      ? `正在处理第 ${job.currentChapter} 章`
+      : job.latestCompletedChapter ? `最新完成：第 ${job.latestCompletedChapter} 章` : '尚未开始';
+    const failedText = job.failedCount ? ` · 失败 ${formatNumber(job.failedCount)} 章` : '';
+    elements.progressLive.textContent = `${liveText}${failedText}`;
+  }
+
+  renderReviewList(job);
 
   const laneCount = Math.max(1, job.config.concurrency);
   const lanes = Array.from({ length: laneCount }, (_, index) => job.activeBatches.find((item) => item.worker === index + 1));
@@ -632,22 +751,113 @@ function renderJob(job) {
 
   elements.pauseJobButton.disabled = !['running', 'paused'].includes(job.status);
   elements.pauseJobButton.textContent = job.status === 'paused' ? '继续' : '暂停';
-  elements.cancelJobButton.disabled = ['completed', 'failed', 'canceled'].includes(job.status);
+  elements.cancelJobButton.disabled = ['completed', 'failed', 'canceled', 'discarded'].includes(job.status);
+  const canRetry = ['completed', 'failed', 'interrupted'].includes(job.status) && job.failedCount > 0;
+  elements.retryArea.classList.toggle('hidden', !canRetry);
+  elements.retrySummary.textContent = canRetry ? `${formatNumber(job.failedCount)} 章${job.config.ruleFallback ? '使用规则回退' : '等待校对'}。可调整模型连接和规则后重试。` : '';
+
+  // 三级自动补偿状态
+  const compensation = job.compensation || { pending: 0, items: [] };
+  if (compensation.pending > 0) {
+    const nextDue = compensation.items.reduce((earliest, item) => {
+      const time = new Date(item.dueAt).getTime();
+      return earliest === null || time < earliest ? time : earliest;
+    }, null);
+    const dueText = nextDue ? `，下次约 ${new Date(nextDue).toLocaleTimeString('zh-CN', { hour12: false })}` : '';
+    elements.compensationSummary.textContent = `${formatNumber(compensation.pending)} 章正在自动补偿队列中（5 分钟 / 30 分钟 / 2 小时各试一次${dueText}），成功后会自动替换规则回退版。`;
+    elements.compensationArea.classList.remove('hidden');
+  } else {
+    elements.compensationArea.classList.add('hidden');
+  }
+  if (job.status !== 'completed') elements.resultPanel.classList.add('hidden');
 
   if (job.status === 'completed' && job.output) {
     elements.resultPanel.classList.remove('hidden');
     elements.downloadTextLink.href = job.output.textUrl;
     elements.downloadReportLink.href = job.output.reportUrl;
-    elements.resultDescription.textContent = `${job.output.textName}；失败回退 ${job.failedChapters.length} 章。`;
+    elements.resultDescription.textContent = `${job.output.textName}；失败待重试 ${job.failedCount} 章。`;
     elements.startJobButton.disabled = false;
     updateStep(4);
   } else if (job.status === 'failed') {
     elements.startJobButton.disabled = false;
     toast(`任务失败：${job.error}`, 'error', 8000);
+  } else if (job.status === 'interrupted') {
+    elements.startJobButton.disabled = false;
+    toast('任务中断，进度已保存；重新导入原稿后可继续。', 'info');
   } else if (job.status === 'canceled') {
     elements.startJobButton.disabled = false;
     toast('任务已取消，已完成结果保留在当前会话。', 'info');
   }
+}
+
+function filteredChapters(job) {
+  const all = job.chapterStates || [];
+  if (state.reviewFilter === 'done') return all.filter((chapter) => chapter.status === 'done');
+  if (state.reviewFilter === 'fallback') return all.filter((chapter) => ['fallback', 'failed'].includes(chapter.status));
+  if (state.reviewFilter === 'pending') return all.filter((chapter) => chapter.status === 'pending');
+  return all;
+}
+
+function renderReviewList(job) {
+  const chapters = filteredChapters(job);
+  const totalPages = Math.max(1, Math.ceil(chapters.length / REVIEW_PAGE_SIZE));
+  if (state.reviewPage >= totalPages) state.reviewPage = totalPages - 1;
+  if (state.reviewPage < 0) state.reviewPage = 0;
+  const start = state.reviewPage * REVIEW_PAGE_SIZE;
+  const pageItems = chapters.slice(start, start + REVIEW_PAGE_SIZE);
+  const html = pageItems.map((chapter) => {
+    const statusText = chapter.status === 'done' ? '<em>模型校对完成</em>' : chapter.status === 'fallback' ? '<em>规则回退 · 待重试</em>' : chapter.status === 'failed' ? '<em>失败 · 待重试</em>' : '<em class="muted">等待处理</em>';
+    const clickable = chapter.status === 'done' || chapter.status === 'fallback';
+    return `<button class="review-chapter ${chapter.status}" data-number="${chapter.number}"${clickable ? '' : ' disabled'}><strong>第 ${chapter.number} 章</strong><span>${escapeHtml(chapter.title || '未命名')}</span>${statusText}</button>`;
+  }).join('') || '<span>当前筛选下没有章节。</span>';
+  if (elements.reviewList.innerHTML !== html) elements.reviewList.innerHTML = html;
+
+  if (elements.reviewPager) {
+    const doneCount = (job.chapterStates || []).filter((chapter) => chapter.status === 'done').length;
+    const fallbackCount = (job.chapterStates || []).filter((chapter) => ['fallback', 'failed'].includes(chapter.status)).length;
+    elements.reviewPager.classList.remove('hidden');
+    elements.reviewPager.innerHTML = `
+      <span>共 ${formatNumber((job.chapterStates || []).length)} 章 · 模型成功 ${formatNumber(doneCount)} · 待重试 ${formatNumber(fallbackCount)} · 每页 ${REVIEW_PAGE_SIZE} 章</span>
+      <span>第 ${state.reviewPage + 1} / ${totalPages} 页</span>
+      <div class="pager-actions">
+        <button class="button ghost compact" data-page="first">« 首页</button>
+        <button class="button ghost compact" data-page="prev">上一页</button>
+        <button class="button ghost compact" data-page="next">下一页</button>
+        <button class="button ghost compact" data-page="last">末页 »</button>
+        <button class="button ghost compact" data-page="latest">跳到最新完成</button>
+      </div>`;
+  }
+}
+
+function changeReviewPage(action) {
+  const job = state.job;
+  if (!job) return;
+  const chapters = filteredChapters(job);
+  const totalPages = Math.max(1, Math.ceil(chapters.length / REVIEW_PAGE_SIZE));
+  if (action === 'first') state.reviewPage = 0;
+  else if (action === 'prev') state.reviewPage = Math.max(0, state.reviewPage - 1);
+  else if (action === 'next') state.reviewPage = Math.min(totalPages - 1, state.reviewPage + 1);
+  else if (action === 'last') state.reviewPage = totalPages - 1;
+  else if (action === 'latest') {
+    const latest = job.latestCompletedChapter || job.currentChapter;
+    const index = chapters.findIndex((chapter) => chapter.number === latest);
+    state.reviewPage = index < 0 ? totalPages - 1 : Math.floor(index / REVIEW_PAGE_SIZE);
+  }
+  renderReviewList(job);
+}
+
+async function retryFailedChapters() {
+  if (!state.job) return;
+  elements.retryFailedButton.disabled = true;
+  try {
+    state.job = await api(`/api/jobs/${state.job.id}/retry`, {
+      method: 'POST', body: JSON.stringify({ provider: providerPayload(), rules: elements.rulesEditor.value }),
+    });
+    elements.startJobButton.disabled = true;
+    renderJob(state.job);
+    schedulePoll(200);
+  } catch (error) { toast(`无法重试：${error.message}`, 'error', 7000); }
+  finally { elements.retryFailedButton.disabled = false; }
 }
 
 async function openComparison(number) {
@@ -677,14 +887,71 @@ async function openComparison(number) {
 
 async function pauseOrResumeJob() {
   if (!state.job) return;
-  const action = state.job.status === 'paused' ? 'resume' : 'pause';
+  if (state.job.status === 'paused') {
+    await resumePersistedJob(state.job.id);
+    return;
+  }
   try {
-    state.job = await api(`/api/jobs/${state.job.id}/${action}`, { method: 'POST', body: '{}' });
+    state.job = await api(`/api/jobs/${state.job.id}/pause`, { method: 'POST', body: '{}' });
     renderJob(state.job);
     schedulePoll(200);
   } catch (error) {
     toast(error.message, 'error');
   }
+}
+
+async function resumePersistedJob(jobId, automatic = false) {
+  try {
+    const job = await api(`/api/jobs/${encodeURIComponent(jobId)}/resume`, {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(state.document ? { documentId: state.document.id } : {}),
+        provider: { apiKey: elements.apiKey.value },
+      }),
+    });
+    state.job = job;
+    elements.resumeCard.classList.add('hidden');
+    elements.progressCard.classList.remove('hidden');
+    renderJob(job);
+    schedulePoll(200);
+    toast('已继续未完成任务。', 'success');
+  } catch (error) {
+    toast(`无法继续任务：${error.message}`, 'error', 7000);
+  }
+}
+
+async function discardResumableJob() {
+  const target = state.resumableJobs[0];
+  if (!target) return;
+  try {
+    await api(`/api/jobs/${encodeURIComponent(target.id)}/discard`, { method: 'POST', body: '{}' });
+    state.resumableJobs = state.resumableJobs.filter((item) => item.id !== target.id);
+    renderResumableBanner();
+    toast('已放弃该未完成任务。', 'info');
+  } catch (error) {
+    toast(error.message, 'error');
+  }
+}
+
+async function loadResumableJobs() {
+  try {
+    const result = await api('/api/jobs/resumable', { method: 'GET', headers: {} });
+    state.resumableJobs = result.jobs || [];
+    renderResumableBanner();
+  } catch {
+    state.resumableJobs = [];
+  }
+}
+
+function renderResumableBanner() {
+  const target = state.resumableJobs[0];
+  if (!target) {
+    elements.resumeCard.classList.add('hidden');
+    return;
+  }
+  elements.resumeCard.classList.remove('hidden');
+  elements.resumeTitle.textContent = `未完成任务：${target.fileName}`;
+  elements.resumeDescription.textContent = `第 ${target.range?.[0] ?? '?'} - ${target.range?.[1] ?? '?'} 章，已有结果 ${formatNumber(target.completedChapters)} / ${formatNumber(target.totalChapters)} 章，其中 ${formatNumber(target.failedCount)} 章待重试。`;
 }
 
 async function cancelJob() {
@@ -734,13 +1001,34 @@ function bindEvents() {
     toast('已恢复推荐校对规则。', 'success');
   });
   elements.testProviderButton.addEventListener('click', testProvider);
+  elements.saveConnectionButton.addEventListener('click', saveConnectionSettings);
+  elements.clearConnectionButton.addEventListener('click', clearConnectionSettings);
   elements.startFreeLlmButton.addEventListener('click', startFreeLlm);
   elements.startJobButton.addEventListener('click', startJob);
   elements.pauseJobButton.addEventListener('click', pauseOrResumeJob);
   elements.cancelJobButton.addEventListener('click', cancelJob);
+  elements.retryFailedButton.addEventListener('click', retryFailedChapters);
+  if (elements.reviewFilters) {
+    elements.reviewFilters.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-filter]');
+      if (!button) return;
+      state.reviewFilter = button.dataset.filter;
+      state.reviewPage = 0;
+      Array.from(elements.reviewFilters.children).forEach((item) => item.classList.toggle('active', item === button));
+      if (state.job) renderReviewList(state.job);
+    });
+  }
+  if (elements.reviewPager) {
+    elements.reviewPager.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-page]');
+      if (button) changeReviewPage(button.dataset.page);
+    });
+  }
+  if (elements.resumeJobButton) elements.resumeJobButton.addEventListener('click', () => resumePersistedJob(state.resumableJobs[0]?.id));
+  if (elements.discardJobButton) elements.discardJobButton.addEventListener('click', discardResumableJob);
   elements.reviewList.addEventListener('click', (event) => {
     const button = event.target.closest('button[data-number]');
-    if (button) openComparison(button.dataset.number);
+    if (button && !button.disabled) openComparison(button.dataset.number);
   });
   elements.closeCompare.addEventListener('click', () => elements.compareDialog.close());
 }
