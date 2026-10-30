@@ -15,6 +15,10 @@ test('规则回退可关闭，失败章节可重试且保留其他章节', { tim
   const model = http.createServer(async (req, res) => {
     let body = ''; for await (const chunk of req) body += chunk;
     const request = JSON.parse(body);
+    if (request.messages?.[0]?.content === '请回复 OK。' && request.model === 'mock') {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ choices: [{ message: { content: 'OK' } }] })); return;
+    }
     if (request.model === 'compat' || request.model === 'other-error') {
       compatibilityRequests.push(request);
       if (request.model === 'other-error') { res.writeHead(400); res.end(JSON.stringify({ error: { param: 'model', message: 'unknown model' } })); return; }
@@ -49,6 +53,9 @@ test('规则回退可关闭，失败章节可重试且保留其他章节', { tim
     const text = `第1章 开始\n${'原文内容。'.repeat(50)}\n第2章 继续\n${'原文内容。'.repeat(50)}`;
     const doc = await req('/api/documents/analyze', { fileName: '测试.txt', text });
     const config = { documentId: doc.id, start: 1, end: 2, mode: 'llm', chaptersPerBatch: 1, concurrency: 2, autoRetryRounds: 0, provider: { baseUrl: `http://127.0.0.1:${model.address().port}`, model: 'mock' } };
+    const probe = await req('/api/provider/chat-test', config.provider);
+    assert.equal(probe.ok, true);
+    assert.ok(Number.isFinite(probe.durationMs));
     const jobs = await Promise.all([req('/api/jobs', { ...config, ruleFallback: true }), req('/api/jobs', { ...config, ruleFallback: false })]);
     const initial = await Promise.all(jobs.map((j) => done(j.id)));
     assert.equal(initial[0].status, 'completed'); assert.equal(initial[0].failedChapters.length, 1); assert.equal(initial[0].reviewedChapters.find((c) => c.number === 2).fallback, true);

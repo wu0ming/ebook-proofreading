@@ -1272,6 +1272,16 @@ async function handleApi(request, response, url) {
     return;
   }
 
+  if (request.method === 'POST' && pathname === '/api/provider/chat-test') {
+    const body = await readJson(request);
+    const config = { baseUrl: normalizeBaseUrl(body.baseUrl), model: modelChain(body.model)[0] || 'auto', apiKey: String(body.apiKey || ''), maxTokens: 256, timeoutMs: 30000 };
+    const startedAt = Date.now();
+    const reply = await requestChat([{ role: 'user', content: '请回复 OK。' }], config, null, 0.1);
+    if (!reply.choices?.length) throw Object.assign(new Error('模型没有返回可用的聊天结果。'), { statusCode: 502 });
+    sendJson(response, 200, { ok: true, durationMs: Date.now() - startedAt });
+    return;
+  }
+
   if (request.method === 'POST' && pathname === '/api/documents/analyze') {
     const body = await readJson(request);
     const text = String(body.text || '');

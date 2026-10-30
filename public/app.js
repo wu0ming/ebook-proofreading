@@ -605,9 +605,8 @@ async function testProvider() {
   elements.providerTestStatus.textContent = '正在测试…';
   elements.providerTestStatus.className = 'inline-status';
   try {
-    const result = await api('/api/provider/test', { method: 'POST', body: JSON.stringify(providerPayload()) });
-    const modelHint = result.models.length ? `，发现 ${result.models.length} 个模型` : '';
-    elements.providerTestStatus.textContent = `连接成功${modelHint}`;
+    const chat = await api('/api/provider/chat-test', { method: 'POST', body: JSON.stringify(providerPayload()) });
+    elements.providerTestStatus.textContent = `模型回复成功（${(chat.durationMs / 1000).toFixed(1)} 秒）`;
     elements.providerTestStatus.className = 'inline-status success';
     toast('模型接口连接成功。', 'success');
   } catch (error) {
