@@ -211,7 +211,7 @@ async function initialize() {
   await loadResumableJobs();
   // 服务重启后，只有已保存的匹配连接才用于自动续跑。
   const jobs = await api('/api/jobs', { method: 'GET', headers: {} });
-  const active = (jobs.jobs || []).find((job) => ['running', 'paused'].includes(job.status));
+  const active = (jobs.jobs || []).find((job) => job.status === 'running');
   if (active) {
     state.job = await api(`/api/jobs/${encodeURIComponent(active.id)}`, { method: 'GET', headers: {} });
     elements.progressCard.classList.remove('hidden');
@@ -219,8 +219,17 @@ async function initialize() {
     schedulePoll(200);
   } else {
     const saved = (() => { try { return JSON.parse(localStorage.getItem(CONNECTION_SETTINGS_KEY) || 'null'); } catch { return null; } })();
-    const target = state.resumableJobs.find((job) => ['interrupted', 'completed'].includes(job.status) && (job.mode === 'rules' || (saved && saved.baseUrl === job.baseUrl && saved.model === job.model)));
+    const target = state.resumableJobs.find((job) => ['interrupted', 'completed'].includes(job.status) && (job.mode === 'rules' || (saved && saved.baseUrl?.replace(/\/chat\/completions\/?$/, '').replace(/\/$/, '') === job.baseUrl && saved.model === job.model)));
     if (target) await resumePersistedJob(target.id, true);
+    else {
+      const paused = (jobs.jobs || []).find((job) => job.status === 'paused');
+      if (paused) {
+        state.job = await api(`/api/jobs/${encodeURIComponent(paused.id)}`, { method: 'GET', headers: {} });
+        elements.progressCard.classList.remove('hidden');
+        renderJob(state.job);
+        schedulePoll(200);
+      }
+    }
   }
   await checkFreeLlm();
   refreshScheduler();
@@ -263,7 +272,7 @@ function loadConnectionSettings() {
   try {
     const saved = JSON.parse(localStorage.getItem(CONNECTION_SETTINGS_KEY) || 'null');
     if (!saved || typeof saved !== 'object') return;
-    if (typeof saved.baseUrl === 'string') elements.baseUrl.value = saved.baseUrl;
+    if (typeof saved.baseUrl === 'string') elements.baseUrl.value = saved.baseUrl.replace(/\/chat\/completions\/?$/, '');
     if (typeof saved.model === 'string') elements.modelName.value = saved.model;
     if (typeof saved.apiKey === 'string') elements.apiKey.value = saved.apiKey;
     if (typeof saved.launcherPath === 'string') elements.launcherPath.value = saved.launcherPath;
@@ -936,7 +945,7 @@ async function discardResumableJob() {
 async function loadResumableJobs() {
   try {
     const result = await api('/api/jobs/resumable', { method: 'GET', headers: {} });
-    state.resumableJobs = result.jobs || [];
+    state.resumableJobs = (result.jobs || []).sort((a, b) => (a.status === 'interrupted' ? 0 : 1) - (b.status === 'interrupted' ? 0 : 1));
     renderResumableBanner();
   } catch {
     state.resumableJobs = [];
@@ -950,8 +959,9 @@ function renderResumableBanner() {
     return;
   }
   elements.resumeCard.classList.remove('hidden');
+  elements.configurationArea.classList.remove('hidden');
   elements.resumeTitle.textContent = `未完成任务：${target.fileName}`;
-  elements.resumeDescription.textContent = `第 ${target.range?.[0] ?? '?'} - ${target.range?.[1] ?? '?'} 章，已有结果 ${formatNumber(target.completedChapters)} / ${formatNumber(target.totalChapters)} 章，其中 ${formatNumber(target.failedCount)} 章待重试。`;
+  elements.resumeDescription.textContent = `第 ${target.range?.[0] ?? '?'} - ${target.range?.[1] ?? '?'} 章，已有结果 ${formatNumber(target.completedChapters)} / ${formatNumber(target.totalChapters)} 章，其中 ${formatNumber(target.failedCount)} 章待重试。模型：${target.model}；继续前请确认下方 API Key。`;
 }
 
 async function cancelJob() {

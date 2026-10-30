@@ -18,5 +18,9 @@ test('本地模型配置保存、载入和清除', () => {
   ctx.loadConnectionSettings();
   assert.equal(fields.baseUrl.value, 'http://localhost:1234/v1'); assert.equal(fields.modelName.value, 'custom-model');
   assert.equal(fields.apiKey.value, 'fake-secret'); assert.equal(fields.launcherPath.value, 'launcher.vbs');
+  fields.baseUrl.value = 'https://example.test/v2/chat/completions';
+  ctx.saveConnectionSettings();
+  ctx.loadConnectionSettings();
+  assert.equal(fields.baseUrl.value, 'https://example.test/v2');
   ctx.clearConnectionSettings(); assert.equal(storage.size, 0); assert.equal(fields.apiKey.value, 'fake-secret');
 });
